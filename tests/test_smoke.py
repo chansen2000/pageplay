@@ -1,4 +1,4 @@
-"""冒烟测试：包与全部模块可导入，CLI 未实现命令返回 2。"""
+"""冒烟测试：包与全部模块可导入，CLI list 命令可执行并返回 0。"""
 
 
 def test_all_modules_importable() -> None:
@@ -13,7 +13,7 @@ def test_all_modules_importable() -> None:
     assert pageplay.__version__ == "0.1.0"
 
 
-def test_list_returns_not_implemented_code() -> None:
+def test_list_returns_zero() -> None:
     from pageplay.cli import main
 
-    assert main(["list"]) == 2
+    assert main(["list"]) == 0

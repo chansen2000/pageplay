@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,14 @@ def get_site(name: str) -> SitePreset:
 
     内置表查不到：raise KeyError，消息列出可用站点名并提示 --url 用法。
     """
-    raise NotImplementedError
+    try:
+        return _BUILTIN[name]
+    except KeyError:
+        available = ", ".join(sorted(_BUILTIN))
+        raise KeyError(
+            f"未知站点 {name!r}；可用站点：{available}。"
+            f"自定义站点请用 --url <登录页URL>，例如 --url https://example.com/login"
+        ) from None
 
 
 def resolve_site(name: str, login_url: str | None = None) -> SitePreset:
@@ -49,9 +57,32 @@ def resolve_site(name: str, login_url: str | None = None) -> SitePreset:
     （最后两段近似），check_cookies=()，home_url=login_url；
     否则走 get_site 内置表。
     """
-    raise NotImplementedError
+    if login_url is None:
+        return get_site(name)
+
+    hostname = urlsplit(login_url).hostname
+    # 单段主机名（如 "localhost"）取不出注册域，同样按非法处理
+    if not hostname or "." not in hostname:
+        raise ValueError(
+            f"无法从 login_url 解析出域名：{login_url!r}；"
+            f"请给形如 https://example.com/login 的合法 URL"
+        )
+
+    # 近似注册域：取 hostname 最后两段（a.b.example.com → example.com）。
+    # 局限：这是朴素近似，处理不了 co.jp / com.cn 这类多段公共后缀
+    # （会得到 "co.jp"），也不识别 github.io 等私有后缀；
+    # 如需精确注册域要引入 PSL 库（如 publicsuffix2）。
+    domain = ".".join(hostname.split(".")[-2:])
+
+    return SitePreset(
+        name=name,
+        login_url=login_url,
+        home_url=login_url,
+        domain=domain,
+        check_cookies=(),
+    )
 
 
 def list_builtin() -> list[SitePreset]:
     """列出全部内置站点预设。"""
-    raise NotImplementedError
+    return list(_BUILTIN.values())
