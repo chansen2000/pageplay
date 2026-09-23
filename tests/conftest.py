@@ -159,3 +159,57 @@ def table_site():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# T8：跨页导航假站（picker 框选层跨页存活测试用）
+# ---------------------------------------------------------------------------
+
+_NAV_START_HTML = """<html><body>
+<h1>导航起点</h1>
+<a id="go" href="/table">去表格页</a>
+</body></html>"""
+
+
+class _NavSiteHandler(BaseHTTPRequestHandler):
+    """跨页假站：GET /start 含指向 /table 的链接；GET /table 复用表格页。"""
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/start"):
+            self._send_html(200, _NAV_START_HTML)
+        elif self.path.startswith("/table"):
+            self._send_html(200, _TABLE_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass  # 静默：不把假站访问日志刷进测试输出
+
+
+@pytest.fixture
+def nav_site():
+    """起本地跨页导航假站（端口 0），yield base_url 字符串，测完关停。
+
+    路由：GET /start → 含 <a id="go" href="/table"> 的起点页；
+    GET /table → 与 table_site 同款 4 列表格页（id="data"）。
+    风格与 fake_site / table_site 一致。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _NavSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

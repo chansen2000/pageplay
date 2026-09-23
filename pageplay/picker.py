@@ -1,10 +1,13 @@
 """框选层：人在页面上圈表格/元素，产出正式 CSS 选择器与动作载荷。
 
-流程（T7c 任务书契约）：run_pick 注入 overlay_js（hover 高亮 + ↑ 扩选 /
-↓ 收回 + Esc 取消 + 点击锁定）→ 人确认后 JS 调 window.__pageplay_onconfirm
-→ python 经 page.expose_function 收 payload → 用 COLLECT_CHAIN_JS 收集
-锁定元素到根的链 → selector_from_chain 生成正式 selector → 组装返回。
-全程不改页面业务 DOM（只 append 覆层/面板，结束移除）。
+流程（T7c 任务书契约）：run_pick 用 add_init_script 注入 overlay_js
+（hover 高亮 + ↑ 扩选 / ↓ 收回 + Esc 取消 + 点击锁定）——每个新文档
+加载时自动布防（跨页存活），当前已加载文档再补一次 evaluate；人确认
+后 JS 调 window.__pageplay_onconfirm（expose_function 绑定跨文档持续
+有效）→ python 收 payload → 用 COLLECT_CHAIN_JS 收集锁定元素到根的
+链 → selector_from_chain 生成正式 selector → 组装返回。覆层 JS 自带
+心跳自愈（同文档内 SPA 剥 DOM/软跳转后自动重新布防）。全程不改页面
+业务 DOM（只 append 覆层/面板，结束移除）。
 
 链序约定（selector_from_chain 与 COLLECT_CHAIN_JS 一致）：根在首、
 目标元素在尾，与生成选择器的书写方向相同。
@@ -56,28 +59,21 @@ COLLECT_CHAIN_JS = """
 # 注入 JS（IIFE）：hover 高亮 + 键盘扩收 + Esc 取消 + 点击锁定/列勾选。
 # 只 append 覆层（#__pageplay_overlay），不改页面业务 DOM；
 # 结束（确认/取消/清理）由 __pageplay_cleanup 移除全部覆层与监听。
+# 经 add_init_script 注入时每个新文档自动布防；同文档内覆层被页面剥掉
+# （SPA 软跳转/DOM 重建）由心跳自愈重新布防，全程幂等、单实例。
 _OVERLAY_JS = """
 (() => {
   if (window.__pageplay_cleanup) { try { window.__pageplay_cleanup(); } catch (e) {} }
 
   const SEM = "table,ul,ol,[role=grid]";
+  const HB_MS = 800;  // 自愈心跳周期：覆层被剥后最迟一个周期重新布防
   let current = null;   // 当前高亮目标
   let locked = null;    // 点击锁定后的目标
   const upStack = [];   // ↑ 扩选记录（↓ 收回用）
-
-  const overlay = document.createElement("div");
-  overlay.id = "__pageplay_overlay";
-  const box = document.createElement("div");
-  box.style.cssText = "position:fixed;display:none;pointer-events:none;z-index:2147483646;"
-    + "border:2px solid #e5484d;background:rgba(229,72,77,.10);box-sizing:border-box;";
-  const panel = document.createElement("div");
-  panel.style.cssText = "position:fixed;top:12px;right:12px;display:none;z-index:2147483647;"
-    + "background:#fff;border:1px solid #ccc;border-radius:6px;padding:10px 12px;"
-    + "font:13px/1.6 -apple-system,sans-serif;color:#222;"
-    + "box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:70vh;overflow:auto;";
-  overlay.appendChild(box);
-  overlay.appendChild(panel);
-  (document.body || document.documentElement).appendChild(overlay);
+  let overlay = null, box = null, panel = null;
+  let ac = null;        // 文档监听生命周期（abort = 监听已拆）
+  let hbTimer = 0;
+  let over = false;     // 会话结束（确认/取消/清理）：不再布防
 
   function semantic(el) {
     try { return (el && el.closest && el.closest(SEM)) || el; } catch (e) { return el; }
@@ -126,30 +122,54 @@ _OVERLAY_JS = """
     if (chain.length > 5) chain = chain.slice(chain.length - 5);
     return chain.map((l, i) => renderLink(l, i === 0)).join(" > ");
   }
+  function buildUi() {  // 建覆层三件套并挂到 body（重建时同步重置拾取态）
+    current = null; locked = null; upStack.length = 0;
+    overlay = document.createElement("div");
+    overlay.id = "__pageplay_overlay";
+    box = document.createElement("div");
+    box.style.cssText = "position:fixed;display:none;pointer-events:none;z-index:2147483646;"
+      + "border:2px solid #e5484d;background:rgba(229,72,77,.10);box-sizing:border-box;";
+    panel = document.createElement("div");
+    panel.style.cssText = "position:fixed;top:12px;right:12px;display:none;z-index:2147483647;"
+      + "background:#fff;border:1px solid #ccc;border-radius:6px;padding:10px 12px;"
+      + "font:13px/1.6 -apple-system,sans-serif;color:#222;"
+      + "box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:70vh;overflow:auto;";
+    overlay.appendChild(box);
+    overlay.appendChild(panel);
+    (document.body || document.documentElement).appendChild(overlay);
+  }
+  function alive() {  // 覆层三件套仍全部挂在文档里
+    return !!(overlay && box && panel && overlay.isConnected
+      && box.isConnected && panel.isConnected);
+  }
   function confirmPick(action, columns) {
     if (!locked) return;
+    over = true;  // 会话结束：停自愈，UI 留给 python 收尾移除
+    clearInterval(hbTimer);
     const payload = {
       selector_hint: hint(locked),
       action: action,
       columns: columns,
       rect: rectOf(locked),
+      url: location.href,  // 确认那一刻的落点（跨页框选时≠拾取起点页）
     };
     window.__pageplay_locked = locked;
     window.__pageplay_last_payload = payload;
     if (window.__pageplay_onconfirm) window.__pageplay_onconfirm(payload);
   }
+  function disarm() { if (ac) ac.abort(); }
   function teardown() {
-    document.removeEventListener("mousemove", onMove, true);
-    document.removeEventListener("click", onClick, true);
-    document.removeEventListener("keydown", onKey, true);
-    overlay.remove();
+    disarm();
+    if (overlay) overlay.remove();
   }
   function cancelPick() {
+    over = true;
+    clearInterval(hbTimer);
     teardown();
     if (window.__pageplay_oncancel) window.__pageplay_oncancel();
   }
   window.__pageplay_cancel = cancelPick;
-  window.__pageplay_cleanup = teardown;
+  window.__pageplay_cleanup = () => { over = true; clearInterval(hbTimer); teardown(); };
 
   function onMove(e) {
     if (locked || overlay.contains(e.target)) return;
@@ -220,9 +240,28 @@ _OVERLAY_JS = """
     panel.appendChild(tb);
     panel.style.display = "block";
   }
-  document.addEventListener("mousemove", onMove, true);
-  document.addEventListener("click", onClick, true);
-  document.addEventListener("keydown", onKey, true);
+  function arm() {  // 文档级监听（AbortController 一把拆），已布防则跳过
+    if (ac && !ac.signal.aborted) return;
+    ac = new AbortController();
+    const opt = {capture: true, signal: ac.signal};
+    document.addEventListener("mousemove", onMove, opt);
+    document.addEventListener("click", onClick, opt);
+    document.addEventListener("keydown", onKey, opt);
+  }
+  function deploy() {  // 布防（幂等）：文档就绪才建 UI；UI 在且监听在则不动
+    if (over || !document.body) return;
+    if (!alive()) buildUi();
+    arm();
+  }
+
+  // 启动：文档就绪立即布防；此后心跳自愈——覆层被页面剥掉或监听被拆
+  // （软跳转/DOM 重建）时按 HB_MS 周期自动重新布防
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", deploy, {once: true});
+  } else {
+    deploy();
+  }
+  hbTimer = setInterval(deploy, HB_MS);
 })();
 """
 
@@ -282,7 +321,13 @@ _ACTIVE: dict = {}
 
 
 def _ensure_bindings(page) -> None:
-    """向页面暴露确认/取消绑定（同页重复拾取时绑定已存在，跳过）。"""
+    """向页面暴露确认/取消绑定（一次安装、跨文档持续有效）。
+
+    Playwright 绑定随 page 注册、每个新文档自动可用，导航后无需也不能
+    重装；同页第二次 run_pick 再装会抛 already registered——捕获后复用
+    既有 shim 即可：回调固定经模块级 _ACTIVE 路由到最近一次 run_pick 的
+    会话，新旧闭包语义完全一致。
+    """
 
     def _on_confirm(payload: dict) -> None:
         state = _ACTIVE.get("state")
@@ -296,29 +341,38 @@ def _ensure_bindings(page) -> None:
             state["cancelled"] = True
             state["event"].set()
 
-    if page.evaluate("() => typeof window.__pageplay_onconfirm") == "function":
-        return
-    page.expose_function("__pageplay_onconfirm", _on_confirm)
-    page.expose_function("__pageplay_oncancel", _on_cancel)
+    try:
+        page.expose_function("__pageplay_onconfirm", _on_confirm)
+        page.expose_function("__pageplay_oncancel", _on_cancel)
+    except Exception as exc:
+        if "already" not in str(exc).lower():
+            raise  # 非重复安装类错误：如实上抛，不吞
 
 
 def run_pick(page, on_confirm) -> dict:
     """注入框选覆层，等人确认，返回组装结果并回调 on_confirm。
 
-    流程：注入 overlay_js → 等待 JS 调 __pageplay_onconfirm（经 expose
-    绑定收 payload）→ page.evaluate(COLLECT_CHAIN_JS) 收集锁定元素到根
-    的链 → selector_from_chain 生成正式 selector → 组装
-    {"selector","action","columns","rect"} → 调 on_confirm(结果)（cli
-    落盘/确认打印钩子）→ 返回。
+    流程：add_init_script(overlay_js)——每个新文档加载时自动布防（跨页
+    存活的关键），随后对当前已加载文档补一次 evaluate（同一份 JS 幂等；
+    init script 不覆盖已加载页）→ 等待 JS 调 __pageplay_onconfirm（经
+    expose 绑定收 payload，跨文档持续有效）→ page.evaluate
+    (COLLECT_CHAIN_JS) 收集锁定元素到根的链 → selector_from_chain 生成
+    正式 selector → 组装 {"selector","action","columns","rect","url"} →
+    调 on_confirm(结果)（cli 落盘/确认打印钩子）→ 返回。
 
-    Esc / 窗口关闭 / 超时无人确认 raise PickCancelled。返回前覆层已清理，
-    页面业务 DOM 不留痕。
+    url 语义 = 用户点确认那一刻的 location.href（跨页框选时即实际落点
+    页 URL），与 cli 记账用的 page.url 同文档取值一致；payload 缺 url
+    时兜底 page.url。
+
+    Esc / 窗口关闭 / 超时无人确认 raise PickCancelled（超时自进入拾取
+    起算，跨页导航不重置）。返回前覆层已清理，页面业务 DOM 不留痕。
     """
     state = {"event": threading.Event(), "cancelled": False, "payload": None}
     _ACTIVE["state"] = state
     _ensure_bindings(page)
     try:
-        page.evaluate(overlay_js())
+        page.add_init_script(overlay_js())  # 新文档自动布防（跨页存活）
+        page.evaluate(overlay_js())         # 当前文档补注入（幂等）
         deadline = time.monotonic() + _PICK_TIMEOUT_SEC
         while not state["event"].is_set():
             if time.monotonic() >= deadline:
@@ -338,6 +392,7 @@ def run_pick(page, on_confirm) -> dict:
             "action": payload.get("action"),
             "columns": payload.get("columns"),
             "rect": payload.get("rect"),
+            "url": payload.get("url") or page.url,
         }
         on_confirm(result)
         return result

@@ -15,6 +15,7 @@ import pytest
 pytest.importorskip("playwright", reason="未安装 playwright 包")
 from playwright.sync_api import sync_playwright  # noqa: E402
 
+from pageplay import picker  # noqa: E402
 from pageplay.picker import (  # noqa: E402
     COLLECT_CHAIN_JS,
     PickCancelled,
@@ -230,3 +231,158 @@ def test_cover_screenshot_missing_selector_raises(page, tmp_path: Path):
     with pytest.raises(ValueError) as ei:
         cover_screenshot(page, "table.missing", tmp_path / "x.png")
     assert "重新框选" in str(ei.value)
+
+
+# ----------------------------------------------------------------------
+# T8：框选层跨页存活（init script 跨文档布防 + 心跳自愈 + url 记当下）
+# ----------------------------------------------------------------------
+
+_T8_TIMEOUT = 20  # 测试专用兜底超时：自愈/跨页失败快速暴露，不等 600s
+
+# 起点页替人走真实跨页链路（T7c 点击语义：未锁定时第一击=截获锁定，
+# 锁定态下点击放行）：先见到覆层 → 第一击锁 h1（等价真人先框选过，
+# 面板在场）→ 第二击点 #go 放行 → 真导航；覆层在场用 sessionStorage 记见证
+_ARM_CLICK_GO = """
+() => {
+  const t = setInterval(() => {
+    if (!document.getElementById("__pageplay_overlay")) return;
+    if (!window.__pageplay_t8_locked) {
+      window.__pageplay_t8_locked = true;
+      document.querySelector("h1").click();
+      return;
+    }
+    clearInterval(t);
+    sessionStorage.setItem("pageplay-t8-start-overlay", "1");
+    document.getElementById("go").click();
+  }, 25);
+}
+"""
+
+# 新文档替人确认（add_init_script 随 /table 文档执行）：见到覆层与表格
+# 都在场才锁定 #data 调确认绑定——覆层不在场即说明 init script 没生效。
+# 注意 add_init_script 传字符串只按脚本源码解析、不自动调用，必须 IIFE。
+_ARM_CONFIRM_ON_TABLE = """
+(() => {
+  if (location.pathname !== "/table") return;
+  const t = setInterval(() => {
+    if (window.__pageplay_onconfirm
+        && document.getElementById("__pageplay_overlay")
+        && document.getElementById("data")) {
+      clearInterval(t);
+      sessionStorage.setItem("pageplay-t8-table-overlay", "1");
+      window.__pageplay_locked = document.getElementById("data");
+      window.__pageplay_onconfirm({
+        selector_hint: "#data", action: "table",
+        columns: ["名称", "价格", "库存", "链接"],
+        rect: {x: 8, y: 40, w: 200, h: 60},
+      });
+    }
+  }, 25);
+})();
+"""
+
+# SPA 单页：按钮软跳转（pushState 换路径 + innerHTML 重建业务 DOM）
+_SPA_HTML = """<html><body>
+<div id="app"><h1>SPA 首屏</h1><button id="nav">换页</button></div>
+<script>
+  document.getElementById("nav").addEventListener("click", () => {
+    history.pushState({}, "", "/list");
+    document.getElementById("app").innerHTML =
+      "<table id='data'><thead><tr><th>名称</th></tr></thead>"
+      + "<tbody><tr><td>苹果</td></tr></tbody></table>";
+  });
+</script>
+</body></html>"""
+
+# 软跳转替人：见覆层 → 触发软跳转（业务 DOM 连同覆层被剥掉）→ 心跳
+# 自愈覆层重新在场后，锁定新 DOM 的表格确认
+_ARM_SOFT_NAV = """
+() => {
+  const t = setInterval(() => {
+    if (!document.getElementById("__pageplay_overlay")) return;
+    clearInterval(t);
+    history.pushState({}, "", "/list");
+    document.getElementById("app").innerHTML =
+      "<table id='data'><thead><tr><th>名称</th></tr></thead>"
+      + "<tbody><tr><td>苹果</td></tr></tbody></table>";
+    const t2 = setInterval(() => {
+      if (window.__pageplay_onconfirm
+          && document.getElementById("__pageplay_overlay")
+          && document.getElementById("data")) {
+        clearInterval(t2);
+        window.__pageplay_locked = document.getElementById("data");
+        window.__pageplay_onconfirm({
+          selector_hint: "#data", action: "table", columns: null,
+          rect: {x: 8, y: 40, w: 200, h: 60},
+        });
+      }
+    }, 50);
+  }, 25);
+}
+"""
+
+
+def _launch_chromium():
+    """起 headless chromium，返回 (pw, browser)；内核缺失返回 (None, None)。"""
+    try:
+        pw = sync_playwright().start()
+        return pw, pw.chromium.launch(headless=True)
+    except Exception:  # 内核缺失/驱动起不来：调用方如实跳过，不假绿
+        return None, None
+
+
+def test_overlay_survives_full_navigation(nav_site, monkeypatch):
+    """真导航跨页：新文档由 init script 自动重新布防，确认仍达 python。
+
+    run_pick 阻塞期间 sync API 单线程，python 无法在场直接断言，用
+    sessionStorage（同源跨导航存活）作覆层在场见证：起点页脚本先见到
+    覆层才点链接；/table 的 init 脚本先见到覆层才确认——任何一步覆层
+    缺席都会卡到兜底超时，测试必失败。
+    """
+    monkeypatch.setattr(picker, "_PICK_TIMEOUT_SEC", _T8_TIMEOUT)
+    pw, browser = _launch_chromium()
+    if browser is None:
+        pytest.skip("playwright chromium 不可用，跳过跨页存活")
+    pg = browser.new_page()
+    try:
+        pg.goto(nav_site + "/start")
+        pg.add_init_script(_ARM_CONFIRM_ON_TABLE)  # 新文档替人确认
+        pg.evaluate(_ARM_CLICK_GO)                 # 当前文档替人点链接
+        result = run_pick(pg, lambda _r: None)
+
+        assert result["action"] == "table"
+        assert result["columns"] == ["名称", "价格", "库存", "链接"]
+        assert pg.url.startswith(nav_site + "/table")
+        assert result["url"] == pg.url  # 确认那一刻的落点：/table，非 /start
+        # 两个文档里覆层都真实在场过（sessionStorage 见证）
+        assert pg.evaluate(
+            "() => sessionStorage.getItem('pageplay-t8-start-overlay')") == "1"
+        assert pg.evaluate(
+            "() => sessionStorage.getItem('pageplay-t8-table-overlay')") == "1"
+        # 结束后当前文档覆层已清场，业务 DOM 不留痕
+        assert pg.evaluate(
+            "() => !document.getElementById('__pageplay_overlay')")
+    finally:
+        pg.close()
+        browser.close()
+        pw.stop()
+
+
+def test_overlay_survives_soft_navigation(page, nav_site, monkeypatch):
+    """SPA 软跳转：同文档 DOM 重建剥掉覆层 → 心跳自愈重新布防可继续框选。
+
+    先 goto 假站再 set_content（保住真 origin；about:blank 上 pushState
+    换路径会被浏览器拒绝），pushState 换路径 + innerHTML 重建即典型 SPA
+    软跳转，覆层随 body 重建被剥，等心跳自愈后替人确认。
+    """
+    monkeypatch.setattr(picker, "_PICK_TIMEOUT_SEC", _T8_TIMEOUT)
+    page.goto(nav_site + "/start")
+    page.set_content(_SPA_HTML)
+    page.evaluate(_ARM_SOFT_NAV)
+    result = run_pick(page, lambda _r: None)
+
+    assert result["action"] == "table"
+    assert result["url"].endswith("/list")  # 确认在软跳转后的路径上发生
+    assert page.query_selector(result["selector"]) is not None  # 新 DOM 命中
+    # 结束后覆层已清场（心跳同停），业务 DOM 不留痕
+    assert page.evaluate("() => !document.getElementById('__pageplay_overlay')")
