@@ -25,6 +25,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 from pageplay.cli import main  # noqa: E402
 from pageplay.cookies import save_snapshot  # noqa: E402
+from pageplay.recipes import save_recipe  # noqa: E402
 
 
 @pytest.fixture
@@ -101,3 +102,29 @@ def test_export_to_out_file_content_and_permissions(home_dir, tmp_path, capsys):
     assert data == [{"name": "sessionid", "value": "test123",
                      "domain": "taobao.com", "expires": -1}]
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
+
+
+def test_run_recipe_end_to_end(seeded_site, table_site, tmp_path, capsys):
+    """端到端：种登录态现场 + 手写 recipe → cli.main run → 真抓 5 行落盘。
+
+    run 默认 headless 打开种子档案，goto 表格假站，等 #data 出现后在
+    页面上下文抽表、CSV+JSON 双份落 --out；产物内容逐行断言。
+    """
+    name, home = seeded_site
+    site_dir = home / "sites" / name
+    save_recipe(site_dir, {
+        "version": 1, "name": "faketest-1", "site": name,
+        "url": table_site + "/table", "action": "table",
+        "selector": "#data", "columns": None,
+    })
+    out_dir = tmp_path / "e2e-out"
+
+    assert main(["run", "faketest-1", "--out", str(out_dir)]) == 0
+
+    json_files = list(out_dir.glob("faketest-1-*.json"))
+    csv_files = list(out_dir.glob("faketest-1-*.csv"))
+    assert len(json_files) == len(csv_files) == 1
+    rows = json.loads(json_files[0].read_text(encoding="utf-8"))
+    assert len(rows) == 5
+    assert rows[0]["名称"] == "商品1" and rows[4]["价格"] == "50"
+    assert "已生成" in capsys.readouterr().out

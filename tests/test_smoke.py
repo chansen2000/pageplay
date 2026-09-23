@@ -10,7 +10,8 @@ def test_all_modules_importable() -> None:
     import pageplay.guard
     import pageplay.logging_setup
 
-    assert pageplay.__version__ == "0.1.0"
+    # 只验证版本元数据存在且非空——不钉死具体值，避免每次发版误报
+    assert isinstance(pageplay.__version__, str) and pageplay.__version__
 
 
 def test_list_returns_zero() -> None:

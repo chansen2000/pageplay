@@ -1,12 +1,12 @@
-"""命令行入口：解析六个子命令并派发到站点/会话/快照模块。
+"""命令行入口：解析九个子命令并派发到站点/会话/快照/recipe 模块。
 
 站点解析：所有命令同用 parse_target——login 支持直接贴网址/域名，
 贴 URL 命中内置预设走自动轮询、陌生站走"人工按回车"交互；预设名与
---url 用法保持兼容。其余命令（doctor/export/open/forget）贴 URL 时
-只用它推导站点名（与 login 落盘的推导名一致，www.taobao.com →
-taobao），按"已存 meta.json 优先 → 内置预设"解析。顶层异常统一映射
-退出码：0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。输出一律业务
-语言，不 dump 原始 dict。
+--url 用法保持兼容。其余命令（doctor/export/open/forget/recipes）
+贴 URL 时只推导站点名（与 login 落盘一致），按"已存 meta.json 优先
+→ 内置预设"解析；pick 同样解析但会打开贴的 URL（没贴则开 home_url）。
+顶层异常统一映射退出码：0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。
+输出一律业务语言，不 dump 原始 dict。
 """
 
 from __future__ import annotations
@@ -16,9 +16,13 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from . import actions, picker, recipes
 from .cookies import export_json, filter_by_domain
 from .guard import RiskTriggered
 from .logging_setup import setup_logging
@@ -296,6 +300,127 @@ def _cmd_forget(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------
+# v0.2 三命令：pick（框选诉求）/ run（确定性重放）/ recipes（清单）
+# ----------------------------------------------------------------------
+
+def _recipe_site_dirs() -> list[Path]:
+    """sites 根下有 recipes/ 目录的站点目录（排序稳定）。"""
+    root = _sites_root()
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if (p / "recipes").is_dir())
+
+
+def _print_locked(result: dict) -> None:
+    """pick 的 on_confirm 钩子：确认瞬间把锁定结果回显给人。"""
+    print(f"已锁定 {result['action']}：{result['selector']}")
+
+
+def _cmd_pick(args: argparse.Namespace) -> int:
+    """pick：起带登录态浏览器，人框选表格/元素，保存 recipe + 封面图。
+    解析同 doctor（已存优先）；框选/截图在 picker 模块，这里只接线；
+    recipe 的 url 记实际落点 page.url，封面存 recipes/<名>.png。
+    """
+    try:
+        _name, pasted_url = parse_target(args.site)
+        site = _resolve_target(args.site)
+    except (KeyError, ValueError) as exc:
+        print(f"站点解析失败：{exc}", file=sys.stderr)
+        return 1
+    site_dir = _site_dir(site.name)
+    session = SiteSession(site, _sites_root())
+    try:
+        page = session.open().new_page()
+        page.goto(pasted_url or site.home_url)
+        picked = picker.run_pick(page, _print_locked)
+        name = args.name or f"{site.name}-{len(recipes.list_recipes(site_dir)) + 1}"
+        recipe = {"version": 1, "name": name, "site": site.name,
+                  "url": page.url, "action": picked["action"],
+                  "selector": picked["selector"], "columns": picked["columns"],
+                  "screenshot": f"{name}.png"}
+        recipes.save_recipe(site_dir, recipe)
+        picker.cover_screenshot(page, picked["selector"],
+                                site_dir / "recipes" / f"{name}.png")
+    except picker.PickCancelled as exc:
+        print(f"已取消：{exc}")
+        return 1
+    finally:
+        session.close()
+    print(f"recipe 已保存：{name}（站点 {site.name}）")
+    print(f"以后一条命令重放：pageplay run {name}")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """run：跨站找 recipe 重放（默认 headless，--show 有头），打印产物。
+
+    recipe 名不分局：各站 recipes/ 依次找，找不到列出现有名字；选择器
+    15s 等不到提示重新 pick；抓表 CSV+JSON 双份（文件名带时间戳），
+    下载存原文件名。产物目录缺省 ~/Downloads/pageplay/<recipe名>/。
+    """
+    site_dir = next((d for d in _recipe_site_dirs()
+                     if (d / "recipes" / f"{args.name}.json").is_file()), None)
+    if site_dir is None:
+        names = sorted(str(r["name"]) for d in _recipe_site_dirs()
+                       for r in recipes.list_recipes(d))
+        known = "、".join(names) if names else "（一个都没有）"
+        print(f"recipe {args.name!r} 不存在；现有 recipe：{known}", file=sys.stderr)
+        return 1
+    recipe = recipes.load_recipe(site_dir, args.name)
+    try:
+        site = _resolve_target(recipe["site"])
+    except KeyError as exc:
+        print(f"recipe 所属站点解析失败：{exc}", file=sys.stderr)
+        return 1
+    out_dir = (Path(args.out).expanduser() if args.out
+               else Path.home() / "Downloads" / "pageplay" / recipe["name"])
+    session = SiteSession(site, _sites_root())
+    try:
+        page = session.open(headless=not args.show).new_page()
+        page.goto(recipe["url"])
+        actions.check_page_risk(page.content())
+        try:
+            page.wait_for_selector(recipe["selector"], timeout=15000)
+        except PlaywrightTimeoutError:
+            print(f"页面结构可能变了，请重新 pick {site.name}", file=sys.stderr)
+            return 1
+        if recipe["action"] == "table":
+            rows = actions.extract_table(page, recipe["selector"],
+                                         recipe.get("columns"))
+            stem = f"{recipe['name']}-{datetime.now():%Y%m%d-%H%M%S}"
+            products = list(actions.save_table(rows, out_dir, stem=stem))
+        else:
+            products = [actions.download_element(page, recipe["selector"],
+                                                 out_dir)]
+    finally:
+        session.close()
+    for product in products:
+        print(f"已生成 {product.resolve()}")
+    return 0
+
+
+def _cmd_recipes(args: argparse.Namespace) -> int:
+    """recipes：列 recipe（名字/动作/URL/创建时间）；无参全部站，带参单站。"""
+    if args.site is not None:
+        site = _resolve_site_or_report(args.site)
+        if site is None:
+            return 1
+        site_dirs = [_site_dir(site.name)]
+    else:
+        site_dirs = _recipe_site_dirs()
+    rows = [(d, r) for d in site_dirs for r in recipes.list_recipes(d)]
+    if not rows:
+        print("暂无 recipe。用 pageplay pick <站点或网址> 框选第一个诉求。")
+        return 0
+    width = max(len(str(r["name"])) for _d, r in rows)
+    print("已保存 recipe：")
+    for _d, r in rows:
+        print(f"  {str(r['name']):<{width}}  {r['action']}  {r['url']}"
+              f"  创建于 {r['created_at']}")
+    return 0
+
+
+# ----------------------------------------------------------------------
 # 参数解析与入口
 # ----------------------------------------------------------------------
 
@@ -336,6 +461,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_forget = sub.add_parser("forget", help="删除站点会话目录")
     p_forget.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
     p_forget.set_defaults(func=_cmd_forget)
+
+    p_pick = sub.add_parser("pick", help="浏览器里框选表格/元素，存为可重放 recipe")
+    p_pick.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
+    p_pick.add_argument("--name", default=None, help="recipe 名（默认 <站点>-<序号>）")
+    p_pick.set_defaults(func=_cmd_pick)
+
+    p_run = sub.add_parser("run", help="重放 recipe：headless 抓表或下载")
+    p_run.add_argument("name", help="recipe 名（pageplay recipes 可查）")
+    p_run.add_argument("--show", action="store_true", help="有头运行（默认 headless）")
+    p_run.add_argument("--out", default=None,
+                       help="产物目录（默认 ~/Downloads/pageplay/<recipe名>）")
+    p_run.set_defaults(func=_cmd_run)
+
+    p_recipes = sub.add_parser("recipes", help="列出已保存的 recipe")
+    p_recipes.add_argument("site", nargs="?", default=None,
+                           help="只列该站点（缺省列全部站点）")
+    p_recipes.set_defaults(func=_cmd_recipes)
 
     return parser
 

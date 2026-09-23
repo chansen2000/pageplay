@@ -17,7 +17,7 @@ pip install -e ".[dev]"
 python -m playwright install chromium
 ```
 
-## 六个命令
+## 命令
 
 ### login：人工登录并保存会话
 
@@ -77,6 +77,30 @@ pageplay forget taobao
 
 删除该站点的浏览器档案 + 快照 + meta，彻底忘记登录态。
 
+### pick：框选表格/元素，存成可重放的 recipe（v0.2）
+
+```bash
+pageplay pick taobao --name daily-orders   # 站点名/网址均可，--name 可省
+```
+
+浏览器打开页面：hover 高亮（点单元格自动认整表），↑ 扩选 / ↓ 收回，点击锁定后
+表格出列勾选条（默认全勾）、普通元素选下载文件；确认后截封面存 recipe，Esc 取消。
+
+### run：headless 重放 recipe 拿产物（v0.2）
+
+```bash
+pageplay run daily-orders --show --out DIR   # 默认 headless；--show 有头看过程
+```
+
+产物默认在 `~/Downloads/pageplay/<recipe名>/`：抓表 CSV+JSON 双份、下载存原始
+文件；选择器等不到会提示"页面结构可能变了"，重新 pick 即可。
+
+### recipes：列出已有 recipe（v0.2）
+
+```bash
+pageplay recipes               # 全部站点；后跟站点名只看某站
+```
+
 ## 存储位置与 PAGEPLAY_HOME
 
 默认存储在 `~/.pageplay/sites/<站点名>/`：
@@ -85,7 +109,8 @@ pageplay forget taobao
 ~/.pageplay/sites/<site>/
 ├── browser-profile/   # 浏览器档案（登录态真身）
 ├── state.json         # cookie 快照（0600）
-└── meta.json          # 站点名/登录URL/保存时间/检测标记
+├── meta.json          # 站点名/登录URL/保存时间/检测标记
+└── recipes/           # pick 存的 recipe（json）+ 封面图（png）
 ```
 
 环境变量 `PAGEPLAY_HOME` 可把根目录指到任意位置：

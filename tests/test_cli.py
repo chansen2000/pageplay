@@ -76,8 +76,9 @@ def install_stub_session(monkeypatch: pytest.MonkeyPatch, **behaviors):
                 raise behaviors["login"]
             return behaviors.get("login", True)
 
-        def open(self, url: str | None = None):
+        def open(self, url: str | None = None, headless: bool = False):
             self.opened_urls.append(url)
+            self.open_headless = headless  # run 重放断言用
             assert context is not None, "open 被意外调用（未注入 context）"
             return context
 

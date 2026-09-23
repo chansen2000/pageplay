@@ -247,6 +247,23 @@ def test_open_with_url_navigates_page(tmp_path):
     assert context.closed is True
 
 
+def test_open_headless_passthrough_default_headful(tmp_path):
+    """open(headless=True) 透传给 launcher（run 重放入口）；缺省仍 headful。"""
+    context = FakeContext([[]])
+    launcher = FakeLauncher(context)
+    session = make_session(tmp_path, launcher)
+
+    session.open(headless=True)
+    assert launcher.calls[-1] == (
+        tmp_path / "sites" / "taobao" / "browser-profile", True)
+
+    session.close()
+    session.open()  # 缺省：headful 行为不变
+    assert launcher.calls[-1] == (
+        tmp_path / "sites" / "taobao" / "browser-profile", False)
+    session.close()
+
+
 def test_write_meta_lands_schema_file(tmp_path):
     """write_meta：公开方法，schema 同设计 §3，不依赖浏览器。"""
     session = make_session(tmp_path, FakeLauncher(None))  # 被调用即炸：不碰浏览器

@@ -228,14 +228,16 @@ class SiteSession:
         """只读快照导出 cookie 列表，不启动浏览器。"""
         return cookies.load_snapshot(self._site_dir)
 
-    def open(self, url: str | None = None) -> BrowserContext:
-        """headful 打开持久 context 并返回，供外部（AI）驱动。
+    def open(self, url: str | None = None,
+             headless: bool = False) -> BrowserContext:
+        """打开持久 context 并返回，供外部（AI）驱动；默认 headful 不变。
 
-        行为：不轮询；不给 url 时不打开页面、不导航，调用方自行
-        context.new_page() / page.goto(...)；给 url 时起 context 后
-        new_page().goto(url)（login 贴网址入口用）。用完调 close() 释放。
+        headless=True 供 run 重放用（不弹窗）。行为：不轮询；不给 url 时
+        不打开页面、不导航，调用方自行 context.new_page() / page.goto(...)；
+        给 url 时起 context 后 new_page().goto(url)（login 贴网址入口用）。
+        用完调 close() 释放。
         """
-        context = self._start_context(headless=False)
+        context = self._start_context(headless=headless)
         if url is not None:
             page = context.new_page()
             page.goto(url)
