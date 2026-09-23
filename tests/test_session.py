@@ -137,9 +137,58 @@ def test_verify_true_with_marker_cookie(tmp_path):
     assert not (tmp_path / "sites" / "taobao" / ".session.lock").exists()
 
 
-def test_verify_false_without_login_state(tmp_path):
+def test_verify_false_without_login_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda _s: None)  # 暖检查轮询瞬时跑完
     session = make_session(tmp_path, FakeLauncher(FakeContext([[]])))
     assert session.verify() is False
+
+
+def test_verify_cold_fail_warm_relogin_success(tmp_path, monkeypatch):
+    """冷检查空 → 暖检查打开落地页等到自动续登 → True + 快照已刷新。"""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)  # 暖轮询瞬时
+    context = FakeContext([[], [make_cookie("_tb_token_")]])  # 冷查空，暖第1轮命中
+    launcher = FakeLauncher(context)
+    session = make_session(tmp_path, launcher)
+
+    assert session.verify() is True
+
+    site_dir = tmp_path / "sites" / "taobao"
+    state = json.loads((site_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["cookies"] == [make_cookie("_tb_token_")]  # 续登出的 cookie 已落盘
+    assert context.pages[0].urls == [SITE.home_url]         # 暖级打开的是落地页
+    assert launcher.calls == [                              # 复用冷级 context，只起一次
+        (site_dir / "browser-profile", True)]
+    assert context.closed is True
+    assert not (site_dir / ".session.lock").exists()
+
+
+def test_verify_cold_and_warm_both_fail(tmp_path, monkeypatch):
+    """恒空：暖级确实走过（goto 落地页 + 轮询到点），两级全败 → False。"""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    context = FakeContext([[]])
+    session = make_session(tmp_path, FakeLauncher(context))
+
+    assert session.verify() is False
+
+    assert context.pages[0].urls == [SITE.home_url]  # 暖级走过
+    assert not (tmp_path / "sites" / "taobao" / "state.json").exists()  # 没刷过快照
+    assert context.closed is True
+
+
+def test_verify_warm_goto_error_is_level_failure_not_crash(tmp_path, monkeypatch):
+    """goto 超时等异常：暖级判败返回 False，不未捕获崩溃，资源照收。"""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    context = FakeContext([[]])
+
+    def timeout_goto(self, url: str) -> None:
+        raise TimeoutError(f"page.goto: Timeout {url} exceeded")
+
+    monkeypatch.setattr(FakePage, "goto", timeout_goto)
+    session = make_session(tmp_path, FakeLauncher(context))
+
+    assert session.verify() is False
+    assert context.closed is True
+    assert not (tmp_path / "sites" / "taobao" / ".session.lock").exists()
 
 
 # ----------------------------------------------------------------------

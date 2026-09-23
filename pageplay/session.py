@@ -24,6 +24,8 @@ from .sites import SitePreset
 log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SEC = 2.0
+_WARM_POLL_INTERVAL_SEC = 1.0   # verify 暖检查轮询间隔
+_WARM_POLL_MAX_TRIES = 15       # verify 暖检查至多等 15s（每 1s 一查）
 _PROFILE_DIRNAME = "browser-profile"
 _LOCK_FILENAME = ".session.lock"
 _STATE_FILENAME = "state.json"
@@ -149,16 +151,61 @@ class SiteSession:
             self.close()
 
     def verify(self) -> bool:
-        """headless 起档案读 cookie，判定登录态是否仍有效。结束即关闭。"""
+        """两级验活：冷检查档案 cookie，冷败再暖检查等站点自动续登。
+
+        冷检查：headless 起档案读 cookie，直接判 has_login_state——
+        档案里还留有落盘的登录标记即判有效，并刷新快照（复用活动
+        context）。
+        暖检查：冷检查查不到标记不等于登录态真失效——_tb_token_ 等
+        会话级 cookie 浏览器关闭即不落盘，冷读档案必然查不到；但档案
+        里的长期 cookie 能让站点打开页面时静默自动续登。此时复用同一
+        context 打开 home_url，每 1s 轮询登录标记至多 15s，等到即判
+        有效并刷新快照（把续登出的会话 cookie 落盘，下次冷检查直接
+        命中）。
+        两级都败才判失效（log 分别记两级结果）；goto 超时等异常只判
+        暖级失败，不炸整体验证。结束（无论成败）关闭浏览器并释放锁。
+        """
         context = self._start_context(headless=True)
         try:
-            ok = cookies.has_login_state(context.cookies(),
-                                         self.site.domain,
-                                         self.site.check_cookies)
+            cold_ok = cookies.has_login_state(context.cookies(),
+                                              self.site.domain,
+                                              self.site.check_cookies)
+            if cold_ok:
+                self.refresh_snapshot()
+                log.info("verify %s: 冷检查命中登录态，快照已刷新",
+                         self.site.name)
+                return True
+            warm_ok = self._warm_relogin_check(context)
         finally:
             self.close()
-        log.info("verify %s: 登录态%s", self.site.name, "有效" if ok else "失效")
-        return ok
+        log.info("verify %s: 登录态%s（冷检查=未命中，暖检查=%s）",
+                 self.site.name, "有效" if warm_ok else "失效",
+                 "命中" if warm_ok else "未命中")
+        return warm_ok
+
+    def _warm_relogin_check(self, context: BrowserContext) -> bool:
+        """verify 暖级：打开落地页等自动续登，拿到标记即刷快照返回 True。
+
+        goto 超时、context 已崩等 playwright 异常只判本级失败（返回
+        False），不向上炸整体验证。
+        """
+        try:
+            page = context.new_page()
+            page.goto(self.site.home_url)
+            for _ in range(_WARM_POLL_MAX_TRIES):
+                if cookies.has_login_state(context.cookies(),
+                                           self.site.domain,
+                                           self.site.check_cookies):
+                    self.refresh_snapshot()
+                    log.info("verify %s: 自动续登成功，快照已刷新",
+                             self.site.name)
+                    return True
+                time.sleep(_WARM_POLL_INTERVAL_SEC)
+            return False
+        except Exception as exc:
+            log.warning("verify %s: 暖检查异常，按本级失败处理：%s",
+                        self.site.name, exc)
+            return False
 
     def refresh_snapshot(self) -> None:
         """从档案读当前 cookie 并刷新快照文件。

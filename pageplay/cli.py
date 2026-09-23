@@ -1,11 +1,12 @@
 """命令行入口：解析六个子命令并派发到站点/会话/快照模块。
 
-站点解析：login 支持直接贴网址/域名（parse_target），贴 URL 命中内置
-预设走自动轮询、陌生站走"人工按回车"交互；预设名与 --url 用法保持
-兼容。其余命令先查内置表、未命中回退已存 meta.json 重建预设（自定义
-站点登录后才能被 doctor/export 等继续操作）。顶层异常统一映射退出码：
-0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。输出一律业务语言，不 dump
-原始 dict。
+站点解析：所有命令同用 parse_target——login 支持直接贴网址/域名，
+贴 URL 命中内置预设走自动轮询、陌生站走"人工按回车"交互；预设名与
+--url 用法保持兼容。其余命令（doctor/export/open/forget）贴 URL 时
+只用它推导站点名（与 login 落盘的推导名一致，www.taobao.com →
+taobao），按"已存 meta.json 优先 → 内置预设"解析。顶层异常统一映射
+退出码：0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。输出一律业务
+语言，不 dump 原始 dict。
 """
 
 from __future__ import annotations
@@ -41,53 +42,82 @@ def _site_dir(name: str) -> Path:
     return _sites_root() / name
 
 
-def _resolve_saved(name: str) -> SitePreset:
-    """非 login 命令的站点解析：先内置表，未命中回退已存 meta.json。
+def _saved_site_names() -> list[str]:
+    """已保存站点名清单：sites 根下有 meta.json 的目录名，排序返回。"""
+    root = _sites_root()
+    if not root.is_dir():
+        return []
+    return sorted(p.parent.name for p in root.glob(f"*/{_META_FILENAME}"))
 
-    自定义站点（login --url 保存的）不在内置表里，但 meta.json 记录了
-    login_url 与 check_cookies，可据此重建预设。两处都查不到时抛
-    KeyError（消息含可用站点与 --url 用法提示）。
+
+def _load_saved_preset(name: str) -> SitePreset | None:
+    """从已存 meta.json 重建站点预设；没有登录记录返回 None。
+
+    自定义站点（login 贴陌生网址保存的）不在内置表里，但 meta.json
+    记录了 login_url 与 check_cookies，可据此重建预设。meta 损坏抛
+    KeyError（消息给修复指引）。这是 meta 重建的唯一实现，login 与
+    非 login 命令不各自维护一套。
     """
+    meta_path = _site_dir(name) / _META_FILENAME
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        login_url = str(meta["login_url"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise KeyError(
+            f"站点 {name!r} 的 meta.json 损坏或缺少 login_url；"
+            f"请删除该站点目录后重新 pageplay login {name} --url <登录页URL>"
+        ) from None
+    hostname = urlsplit(login_url).hostname or ""
+    if "." not in hostname:
+        raise KeyError(
+            f"站点 {name!r} 的 login_url 非法：{login_url!r}；"
+            f"请重新 pageplay login {name} --url https://example.com/login"
+        ) from None
+    return SitePreset(
+        name=name,
+        login_url=login_url,
+        home_url=login_url,
+        domain=".".join(hostname.split(".")[-2:]),  # 注册域近似，与 resolve_site 一致
+        check_cookies=tuple(meta.get("check_cookies") or ()),
+    )
+
+
+def _resolve_target(arg: str) -> SitePreset:
+    """非 login 命令的统一站点解析入口（doctor/export/open/forget 共用）。
+
+    与 login 同用 parse_target：贴网址/域名先推导站点名（www.taobao.com
+    → taobao，与 login 落盘的推导名一致）；贴的 URL 在这里只用于推导
+    名字，不会打开。解析顺序：已存优先（meta.json → _load_saved_preset）
+    → 内置预设（get_site）→ 都没有抛 KeyError，消息给可执行的 login
+    指引与可用站点清单（不再误导用户用 --url）。
+    """
+    name, _pasted_url = parse_target(arg)
+    saved = _load_saved_preset(name)
+    if saved is not None:
+        return saved
     try:
         return get_site(name)
     except KeyError:
-        meta_path = _site_dir(name) / _META_FILENAME
-        if not meta_path.is_file():
-            raise  # 原样抛出 get_site 的 KeyError（含可用站点提示）
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            login_url = str(meta["login_url"])
-        except (OSError, ValueError, KeyError, TypeError):
-            raise KeyError(
-                f"站点 {name!r} 的 meta.json 损坏或缺少 login_url；"
-                f"请删除该站点目录后重新 pageplay login {name} --url <登录页URL>"
-            ) from None
-        hostname = urlsplit(login_url).hostname or ""
-        if "." not in hostname:
-            raise KeyError(
-                f"站点 {name!r} 的 login_url 非法：{login_url!r}；"
-                f"请重新 pageplay login {name} --url https://example.com/login"
-            ) from None
-        return SitePreset(
-            name=name,
-            login_url=login_url,
-            home_url=login_url,
-            domain=".".join(hostname.split(".")[-2:]),  # 注册域近似，与 resolve_site 一致
-            check_cookies=tuple(meta.get("check_cookies") or ()),
-        )
+        saved_names = _saved_site_names()
+        builtin_names = ", ".join(sorted(s.name for s in list_builtin()))
+        raise KeyError(
+            f"站点 {name!r} 还没有登录记录；"
+            f"先运行 pageplay login {arg.strip()}。"
+            f"已存站点：{', '.join(saved_names) if saved_names else '无'}；"
+            f"内置：{builtin_names}"
+        ) from None
 
 
-def _resolve_site_or_report(name: str, login_url: str | None = None) -> SitePreset | None:
-    """解析站点预设；非法站点名/URL 打印人话到 stderr 并返回 None。
+def _resolve_site_or_report(arg: str) -> SitePreset | None:
+    """解析站点预设；非法目标打印人话到 stderr 并返回 None。
 
-    调用方拿到 None 直接 return 1。login 传入 --url 时走 resolve_site
-    自定义预设；其余命令 login_url 为 None，走 _resolve_saved（内置表
-    + meta.json 回退）。
+    调用方拿到 None 直接 return 1。login 不走这里（它有自己的两档
+    解析 + 贴 URL 打开行为），但底层推导同用 sites.parse_target。
     """
     try:
-        if login_url is not None:
-            return resolve_site(name, login_url)
-        return _resolve_saved(name)
+        return _resolve_target(arg)
     except (KeyError, ValueError) as exc:
         print(f"站点解析失败：{exc}", file=sys.stderr)
         return None
@@ -290,21 +320,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list.set_defaults(func=_cmd_list)
 
     p_doctor = sub.add_parser("doctor", help="检查登录态是否仍有效")
-    p_doctor.add_argument("site", help="站点名")
+    p_doctor.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
     p_doctor.set_defaults(func=_cmd_doctor)
 
     p_export = sub.add_parser("export", help="导出 cookie 为精简 JSON")
-    p_export.add_argument("site", help="站点名")
+    p_export.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
     p_export.add_argument("--out", default=None,
                           help="输出文件路径（缺省或 - 打印到终端；文件权限 0600）")
     p_export.set_defaults(func=_cmd_export)
 
     p_open = sub.add_parser("open", help="打开 headful 持久浏览器会话")
-    p_open.add_argument("site", help="站点名")
+    p_open.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
     p_open.set_defaults(func=_cmd_open)
 
     p_forget = sub.add_parser("forget", help="删除站点会话目录")
-    p_forget.add_argument("site", help="站点名")
+    p_forget.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
     p_forget.set_defaults(func=_cmd_forget)
 
     return parser

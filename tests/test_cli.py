@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -285,7 +286,121 @@ def test_forget_missing_site_returns_one(home_dir, capsys):
 
 
 # ----------------------------------------------------------------------
-# 退出码映射：风控 2 / 非法站点名 1
+# 非 login 命令贴网址/域名：统一解析（T5：与 login 同一套推导）
+# ----------------------------------------------------------------------
+
+def _write_saved_site(home_dir: Path, name: str = "faketest",
+                      login_url: str = "https://demo.example.com/login") -> Path:
+    """手写一个已登录站点现场（meta.json + state.json），等价 login 落盘。"""
+    site_dir = home_dir / "sites" / name
+    site_dir.mkdir(parents=True)
+    (site_dir / "meta.json").write_text(json.dumps({
+        "site": name, "login_url": login_url,
+        "saved_at": "2026-09-23T10:00:00", "check_cookies": ["sessionid"],
+    }), encoding="utf-8")
+    (site_dir / "state.json").write_text(json.dumps({
+        "version": 1, "site": name, "saved_at": "2026-09-23T10:00:00",
+        "cookies": [{"name": "sessionid", "value": "sess-v1",
+                     "domain": "demo.example.com", "path": "/", "expires": -1,
+                     "httpOnly": False, "secure": False}],
+    }), encoding="utf-8")
+    return site_dir
+
+
+def test_doctor_pasted_url_of_saved_site_resolves_and_verifies(
+        home_dir, monkeypatch, capsys):
+    """贴 URL 形式访问已存站：faketest.xxx → 推导 faketest → 命中已存。"""
+    _write_saved_site(home_dir)
+    created = install_stub_session(
+        monkeypatch, verify=True, context=StubContext([[]]))
+
+    assert main(["doctor", "faketest.xxx"]) == 0
+
+    (session,) = created
+    assert session.site.name == "faketest"
+    assert session.site.login_url == "https://demo.example.com/login"
+    assert session.site.domain == "example.com"   # meta login_url 推导注册域
+    assert session.site.check_cookies == ("sessionid",)
+    assert session.snapshot_refreshed is True
+    out = capsys.readouterr().out
+    assert "faketest" in out and "登录态有效" in out
+
+
+def test_export_pasted_url_of_saved_site_exports_cookies(home_dir, capsys):
+    """export 同样贴 URL：真实 SiteSession 只读快照，导出含种下的 cookie。"""
+    _write_saved_site(home_dir)
+
+    assert main(["export", "faketest.xxx"]) == 0
+
+    out = capsys.readouterr().out
+    assert "sessionid" in out and "sess-v1" in out
+
+
+def test_saved_meta_takes_priority_over_builtin(home_dir, monkeypatch):
+    """已存优先：taobao 有登录记录时按 meta 重建预设，不用内置表。"""
+    _write_saved_site(home_dir, name="taobao",
+                      login_url="https://custom.example.com/login")
+    created = install_stub_session(
+        monkeypatch, verify=True, context=StubContext([[]]))
+
+    assert main(["doctor", "www.taobao.com"]) == 0
+
+    (session,) = created
+    assert session.site.login_url == "https://custom.example.com/login"
+    assert session.site.check_cookies == ("sessionid",)  # 非内置的 _tb_token_
+
+
+def test_doctor_pasted_builtin_url_unsaved_resolves_builtin(home_dir, monkeypatch):
+    """贴内置站 URL 但从未登录：推导名命中内置预设，验活照常走。"""
+    created = install_stub_session(
+        monkeypatch, verify=True, context=StubContext([[]]))
+
+    assert main(["doctor", "www.taobao.com"]) == 0
+
+    (session,) = created
+    assert session.site.name == "taobao"
+    assert session.site.check_cookies == ("_tb_token_",)
+
+
+def test_doctor_preset_name_still_resolves_builtin(home_dir, monkeypatch, capsys):
+    """预设名不回归：doctor taobao 照常解析内置预设并验活。"""
+    created = install_stub_session(
+        monkeypatch, verify=True, context=StubContext([[]]))
+
+    assert main(["doctor", "taobao"]) == 0
+
+    (session,) = created
+    assert session.site.name == "taobao"
+    assert "登录态有效" in capsys.readouterr().out
+
+
+def test_pasted_unknown_site_without_login_returns_one_with_login_hint(
+        home_dir, capsys):
+    """贴从未登录过的 URL：报错含 login 指引与已存站点清单，无 --url 误导。"""
+    _write_saved_site(home_dir)  # 让"已存站点"列表有内容可断言
+
+    assert main(["doctor", "neverlogin.com"]) == 1
+
+    err = capsys.readouterr().err
+    assert "还没有登录记录" in err
+    assert "pageplay login neverlogin.com" in err  # 原样回显输入作指引
+    assert "已存站点：faketest" in err
+    assert "内置：sycm, taobao" in err
+    assert "--url" not in err  # 误导提示已删
+
+
+def test_forget_pasted_url_of_saved_site(home_dir, capsys):
+    """forget 同一入口：贴 URL 推导名字命中已存，目录被删。"""
+    site_dir = _write_saved_site(home_dir)
+
+    assert main(["forget", "faketest.xxx"]) == 0
+
+    assert not site_dir.exists()
+    assert "已删除" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# 退出码映射：风控 2 / 未保存且未内置的站点名 1
 # ----------------------------------------------------------------------
 
 def test_risk_triggered_maps_to_two(home_dir, monkeypatch, capsys):
@@ -296,7 +411,10 @@ def test_risk_triggered_maps_to_two(home_dir, monkeypatch, capsys):
     assert "风控" in err
 
 
-def test_unknown_site_name_returns_one(home_dir, capsys):
+def test_unsaved_site_name_returns_one_with_login_hint(home_dir, capsys):
+    """未保存也未内置的名字：报错给 login 指引与可用站点清单。"""
     assert main(["doctor", "no-such-site"]) == 1
     err = capsys.readouterr().err
-    assert "未知站点" in err  # get_site KeyError 消息含可用站点提示
+    assert "还没有登录记录" in err
+    assert "pageplay login no-such-site" in err
+    assert "已存站点" in err and "内置：sycm, taobao" in err
