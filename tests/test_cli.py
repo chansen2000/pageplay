@@ -12,29 +12,83 @@ import pytest
 
 from pageplay.cli import main
 from pageplay.guard import RiskTriggered
+from pageplay.sites import get_site
 
 
 # ----------------------------------------------------------------------
 # SiteSession 替身：记录构造参数，方法行为按 behaviors 配置
 # ----------------------------------------------------------------------
 
+class StubPage:
+    """替身页面：只记 goto 的 URL。"""
+
+    def __init__(self, urls: list[str]) -> None:
+        self._urls = urls
+
+    def goto(self, url: str) -> None:
+        self._urls.append(url)
+
+
+class StubContext:
+    """替身 context：cookies() 逐轮返回 batches，最后一批永久重复。"""
+
+    def __init__(self, cookie_batches: list[list[dict]]) -> None:
+        self._batches = list(cookie_batches) or [[]]
+        self.goto_urls: list[str] = []
+        self.closed = False
+
+    def cookies(self) -> list[dict]:
+        if len(self._batches) > 1:
+            return self._batches.pop(0)
+        return self._batches[0]
+
+    def new_page(self) -> StubPage:
+        return StubPage(self.goto_urls)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def install_stub_session(monkeypatch: pytest.MonkeyPatch, **behaviors):
     """把 cli 里的 SiteSession 换成替身，返回"已创建实例"列表供断言。"""
     import pageplay.cli as cli
 
+    from pageplay.cookies import save_snapshot
+
     created: list = []
+    context = behaviors.get("context")
 
     class StubSession:
         def __init__(self, site, sites_root):
             self.site = site
             self.sites_root = sites_root
+            self.login_calls: list[dict] = []
+            self.opened_urls: list[str] = []
+            self.snapshot_refreshed = False
+            self.meta_written = False
+            self.closed = False
             created.append(self)
 
-        def login(self, timeout_sec: int = 300) -> bool:
-            self.login_timeout = timeout_sec
+        def login(self, timeout_sec: int = 300, url: str | None = None) -> bool:
+            self.login_calls.append({"timeout_sec": timeout_sec, "url": url})
             if isinstance(behaviors.get("login"), Exception):
                 raise behaviors["login"]
             return behaviors.get("login", True)
+
+        def open(self, url: str | None = None):
+            self.opened_urls.append(url)
+            assert context is not None, "open 被意外调用（未注入 context）"
+            return context
+
+        def refresh_snapshot(self) -> None:
+            self.snapshot_refreshed = True
+            save_snapshot(self.sites_root / self.site.name, context.cookies())
+
+        def write_meta(self) -> None:
+            self.meta_written = True
+
+        def close(self) -> None:
+            self.closed = True
 
         def verify(self) -> bool:
             if isinstance(behaviors.get("verify"), Exception):
@@ -93,7 +147,7 @@ def test_login_timeout_returns_one(home_dir, fake_site, monkeypatch, capsys):
     (session,) = created
     assert session.site.name == "mysite"
     assert session.site.login_url == url  # --url 已传入站点解析
-    assert session.login_timeout == 0     # 极小超时直达超时路径
+    assert session.login_calls[0]["timeout_sec"] == 0  # 极小超时直达超时路径
     err = capsys.readouterr().err
     assert "超时" in err and "login" in err  # 人话提示重跑 login
 
@@ -105,6 +159,113 @@ def test_login_success_returns_zero_and_next_commands(home_dir, monkeypatch, cap
     out = capsys.readouterr().out
     assert "taobao" in out and "登录成功" in out
     assert "doctor taobao" in out and "export taobao" in out  # 后续命令指引
+
+
+# ----------------------------------------------------------------------
+# login 贴网址/域名：自动档（命中预设）与回车档（陌生站）
+# ----------------------------------------------------------------------
+
+def _enter_cookie(domain: str = "newsite.com") -> dict:
+    return {"name": "sid", "value": "v1", "domain": domain, "path": "/",
+            "expires": -1, "httpOnly": False, "secure": False}
+
+
+def test_login_pasted_builtin_url_keeps_preset_polling(home_dir, monkeypatch, capsys):
+    """贴 www.taobao.com：命中 taobao 预设（标记保留），打开贴的页面。"""
+    created = install_stub_session(monkeypatch, login=True)
+
+    assert main(["login", "www.taobao.com"]) == 0
+
+    (session,) = created
+    assert session.site.name == "taobao"
+    assert session.site.check_cookies == ("_tb_token_",)   # 预设 check_cookies 沿用
+    assert session.login_calls == [
+        {"timeout_sec": 300, "url": "https://www.taobao.com"}]  # 自动档打开贴的 URL
+    assert session.opened_urls == []  # 未走回车档 open
+    out = capsys.readouterr().out
+    assert "登录成功" in out
+
+
+def test_login_preset_name_still_auto_without_url(home_dir, monkeypatch, capsys):
+    """预设名兼容：login taobao 走原自动档，url=None（用预设 login_url）。"""
+    created = install_stub_session(monkeypatch, login=True)
+
+    assert main(["login", "taobao"]) == 0
+    (session,) = created
+    assert session.login_calls == [{"timeout_sec": 300, "url": None}]
+    assert session.site.login_url == get_site("taobao").login_url
+
+
+def test_login_pasted_unknown_site_enter_mode_full_flow(home_dir, monkeypatch, capsys):
+    """回车档全流程：空 cookie 提示再按 → 第二次抓到 → 快照/meta 落地 → 0。"""
+    created = install_stub_session(monkeypatch, context=StubContext([
+        [], [_enter_cookie()],
+    ]))
+    presses = iter(["", ""])
+    monkeypatch.setattr("builtins.input", lambda: next(presses))
+
+    rc = main(["login", "www.newsite.com"])
+
+    assert rc == 0
+    (session,) = created
+    assert session.site.name == "newsite"          # 注册域推导的站点名
+    assert session.site.domain == "newsite.com"
+    assert session.site.check_cookies == ()        # 陌生站：有 cookie 即算
+    assert session.opened_urls == ["https://www.newsite.com"]  # 打开贴的页面
+    assert session.snapshot_refreshed and session.meta_written
+    assert session.closed is True                  # 结束必关浏览器
+    out = capsys.readouterr().out
+    assert "https://www.newsite.com" in out
+    assert "按回车" in out
+    assert "未抓到该域 cookie" in out              # 第一次空 cookie 的提示
+    assert "登录成功" in out and "doctor newsite" in out
+    state = json.loads(
+        (home_dir / "sites" / "newsite" / "state.json").read_text(encoding="utf-8"))
+    assert state["cookies"] == [_enter_cookie()]   # 快照真实落地
+
+
+def test_login_pasted_unknown_site_first_press_has_cookie(home_dir, monkeypatch, capsys):
+    """一次回车即抓到 cookie：不提示"未抓到"，直接保存。"""
+    created = install_stub_session(monkeypatch, context=StubContext([
+        [_enter_cookie()],
+    ]))
+    presses = iter([""])
+    monkeypatch.setattr("builtins.input", lambda: next(presses))
+
+    assert main(["login", "newsite.com"]) == 0     # 裸域名同样可贴
+    (session,) = created
+    assert session.opened_urls == ["https://newsite.com"]
+    out = capsys.readouterr().out
+    assert "未抓到该域 cookie" not in out
+
+
+def test_login_enter_mode_cookie_of_other_domain_keeps_waiting(home_dir, monkeypatch, capsys):
+    """回车档按域过滤：只有他域 cookie 也算没抓到，继续等回车。"""
+    created = install_stub_session(monkeypatch, context=StubContext([
+        [_enter_cookie(domain="other.com")], [_enter_cookie()],
+    ]))
+    presses = iter(["", ""])
+    monkeypatch.setattr("builtins.input", lambda: next(presses))
+
+    assert main(["login", "www.newsite.com"]) == 0
+    out = capsys.readouterr().out
+    assert "未抓到该域 cookie" in out              # 他域 cookie 不通过
+
+
+def test_login_enter_mode_interrupt_returns_130_and_closes(home_dir, monkeypatch, capsys):
+    """回车等待中 Ctrl-C：130 退出且浏览器已关（不漏档案锁）。"""
+    created = install_stub_session(monkeypatch, context=StubContext([[]]))
+
+    def raise_interrupt():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", raise_interrupt)
+
+    assert main(["login", "www.newsite.com"]) == 130
+    (session,) = created
+    assert session.closed is True
+    err = capsys.readouterr().err
+    assert "已中断" in err
 
 
 # ----------------------------------------------------------------------

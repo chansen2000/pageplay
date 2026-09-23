@@ -1,9 +1,11 @@
 """命令行入口：解析六个子命令并派发到站点/会话/快照模块。
 
-站点解析：login 用 --url（可自定义站）；其余命令先查内置表、未命中
-回退已存 meta.json 重建预设（自定义站点登录后才能被 doctor/export 等
-继续操作）。顶层异常统一映射退出码：0 成功 / 1 业务失败 / 2 风控 /
-130 用户中断。输出一律业务语言，不 dump 原始 dict。
+站点解析：login 支持直接贴网址/域名（parse_target），贴 URL 命中内置
+预设走自动轮询、陌生站走"人工按回车"交互；预设名与 --url 用法保持
+兼容。其余命令先查内置表、未命中回退已存 meta.json 重建预设（自定义
+站点登录后才能被 doctor/export 等继续操作）。顶层异常统一映射退出码：
+0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。输出一律业务语言，不 dump
+原始 dict。
 """
 
 from __future__ import annotations
@@ -16,11 +18,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .cookies import export_json
+from .cookies import export_json, filter_by_domain
 from .guard import RiskTriggered
 from .logging_setup import setup_logging
 from .session import SiteSession
-from .sites import SitePreset, get_site, list_builtin, resolve_site
+from .sites import SitePreset, get_site, list_builtin, parse_target, resolve_site
 
 _STATE_FILENAME = "state.json"
 _META_FILENAME = "meta.json"
@@ -95,21 +97,66 @@ def _resolve_site_or_report(name: str, login_url: str | None = None) -> SitePres
 # 六个子命令
 # ----------------------------------------------------------------------
 
+def _login_by_enter(session: SiteSession, url: str) -> None:
+    """陌生站交互式登录：打开贴的页面，人工按回车后收该域 cookie。
+
+    有该域 cookie 即刷新快照、写 meta 返回；空则提示后再等一次回车。
+    结束（含中途异常/中断）必关浏览器释放档案锁。
+    """
+    print(f"正在打开 {url}…")
+    print("请在浏览器窗口里完成登录（滑块/扫码自行通过），"
+          "完成后回到本窗口按回车保存会话")
+    try:
+        context = session.open(url)
+        while True:
+            input()
+            if filter_by_domain(context.cookies(), session.site.domain):
+                break
+            print("未抓到该域 cookie，登录完成后再按一次回车")
+        session.refresh_snapshot()
+        session.write_meta()
+    finally:
+        session.close()
+
+
 def _cmd_login(args: argparse.Namespace) -> int:
-    """login：打开浏览器人工登录，轮询登录态并落会话快照。"""
-    site = _resolve_site_or_report(args.site, args.url)
-    if site is None:
+    """login：贴网址/域名或给站点名，打开浏览器人工登录并落会话快照。
+
+    两档：贴的目标命中内置预设（注册域对上）→ 自动档，沿用该预设
+    check_cookies 轮询、打开贴的页面；陌生站 → 回车档，人工按回车后
+    收该域 cookie（有 cookie 即保存）。预设名与 --url 用法不变。
+    """
+    try:
+        name, pasted_url = parse_target(args.site)
+    except ValueError as exc:
+        print(f"站点解析失败：{exc}", file=sys.stderr)
         return 1
-    print(f"正在打开 {site.name} 登录页，请在浏览器窗口里完成登录"
-          f"（滑块/扫码自行通过），最长等待 {args.timeout} 秒…")
+    effective_url = pasted_url or args.url
+    hit_builtin = pasted_url is not None and name in {
+        s.name for s in list_builtin()}
+
+    try:
+        site = (get_site(name) if hit_builtin
+                else resolve_site(name, effective_url))
+    except (KeyError, ValueError) as exc:
+        print(f"站点解析失败：{exc}", file=sys.stderr)
+        return 1
+
     session = SiteSession(site, _sites_root())
-    if not session.login(timeout_sec=args.timeout):
-        hint = f"pageplay login {site.name}"
-        if args.url:
-            hint += f" --url {args.url}"
-        print(f"{site.name}：超时未检测到登录态，浏览器已关闭。"
-              f"请重跑 {hint} 再试一次。", file=sys.stderr)
-        return 1
+    if pasted_url is not None and not hit_builtin:
+        _login_by_enter(session, effective_url)  # 回车档：陌生站
+    else:
+        # 自动档：预设名 / --url 自定义 / 贴 URL 命中预设（打开贴的页面）
+        print(f"正在打开 {site.name} 登录页，请在浏览器窗口里完成登录"
+              f"（滑块/扫码自行通过），最长等待 {args.timeout} 秒…")
+        if not session.login(timeout_sec=args.timeout,
+                             url=effective_url if hit_builtin else None):
+            hint = f"pageplay login {site.name}"
+            if args.url:
+                hint += f" --url {args.url}"
+            print(f"{site.name}：超时未检测到登录态，浏览器已关闭。"
+                  f"请重跑 {hint} 再试一次。", file=sys.stderr)
+            return 1
     print(f"{site.name}：登录成功，登录态已保存到 {_site_dir(site.name)}")
     print(f"后续可用：pageplay doctor {site.name} ｜ "
           f"pageplay export {site.name} ｜ pageplay open {site.name}")
@@ -231,7 +278,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_login = sub.add_parser("login", help="人工登录并保存会话快照")
-    p_login.add_argument("site", help="站点名（保存/查找时使用，如 taobao）")
+    p_login.add_argument(
+        "site",
+        help="站点名（如 taobao）或网址/域名（如 www.taobao.com，"
+             "命中预设自动识别，陌生站登录后按回车保存）")
     p_login.add_argument("--url", default=None, help="自定义登录页 URL（不走内置预设）")
     p_login.add_argument("--timeout", type=int, default=300, help="等待人工登录的超时秒数")
     p_login.set_defaults(func=_cmd_login)

@@ -118,9 +118,11 @@ class SiteSession:
     # 业务动作
     # ------------------------------------------------------------------
 
-    def login(self, timeout_sec: int = 300) -> bool:
+    def login(self, timeout_sec: int = 300, url: str | None = None) -> bool:
         """headful 打开登录页，每 2s 轮询 cookies。
 
+        url 给定时打开该页面（login 贴网址命中预设：打开客户贴的页面），
+        否则打开预设 login_url，原行为不变。
         登录成功：刷新快照、写 meta.json、返回 True；超时返回 False。
         结束（无论成败）都会关闭浏览器并释放档案锁。
         """
@@ -128,7 +130,7 @@ class SiteSession:
         context = self._start_context(headless=False)
         try:
             page = context.new_page()
-            page.goto(self.site.login_url)
+            page.goto(url if url is not None else self.site.login_url)
             log.info("login %s: 等待人在浏览器完成登录（timeout=%ss）",
                      self.site.name, timeout_sec)
             while True:
@@ -137,7 +139,7 @@ class SiteSession:
                                            self.site.check_cookies):
                     log.info("login %s: 检测到登录态标记", self.site.name)
                     self.refresh_snapshot()
-                    self._write_meta()
+                    self.write_meta()
                     return True
                 if time.monotonic() >= deadline:
                     log.info("login %s: 超时未检测到登录态", self.site.name)
@@ -179,13 +181,19 @@ class SiteSession:
         """只读快照导出 cookie 列表，不启动浏览器。"""
         return cookies.load_snapshot(self._site_dir)
 
-    def open(self) -> BrowserContext:
+    def open(self, url: str | None = None) -> BrowserContext:
         """headful 打开持久 context 并返回，供外部（AI）驱动。
 
-        行为：不打开页面、不导航、不轮询；调用方自行
-        context.new_page() / page.goto(...)，用完调 close() 释放。
+        行为：不轮询；不给 url 时不打开页面、不导航，调用方自行
+        context.new_page() / page.goto(...)；给 url 时起 context 后
+        new_page().goto(url)（login 贴网址入口用）。用完调 close() 释放。
         """
-        return self._start_context(headless=False)
+        context = self._start_context(headless=False)
+        if url is not None:
+            page = context.new_page()
+            page.goto(url)
+            log.info("session %s: 已打开 %s", self.site.name, url)
+        return context
 
     def close(self) -> None:
         """关闭当前会话持有的浏览器资源并释放档案锁（幂等）。"""
@@ -218,8 +226,12 @@ class SiteSession:
     # meta 与档案锁
     # ------------------------------------------------------------------
 
-    def _write_meta(self) -> None:
-        """写 meta.json（设计 §3 schema：site/login_url/saved_at/check_cookies）。"""
+    def write_meta(self) -> None:
+        """写 meta.json（设计 §3 schema：site/login_url/saved_at/check_cookies）。
+
+        login 成功路径与 CLI 交互式登录共用；调用前站点目录必须已存在
+        （正常流程 open/login 起档案锁时已建）。
+        """
         meta = {
             "site": self.site.name,
             "login_url": self.site.login_url,

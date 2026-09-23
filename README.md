@@ -23,11 +23,17 @@ python -m playwright install chromium
 
 ```bash
 pageplay login taobao                    # 内置预设
+pageplay login www.taobao.com            # 直接贴网址/域名也行
 pageplay login mysite --url https://demo.example.com/login   # 自定义站点
 pageplay login taobao --timeout 600      # 调整等待人工登录的超时秒数
 ```
 
 弹出浏览器打开登录页，你在窗口里完成登录，pageplay 检测到登录态标记后自动保存并退出。
+
+直接贴网址/域名时两档行为：贴的站命中内置预设（如 `www.taobao.com` 对上
+taobao）→ 打开贴的页面，自动检测登录态后保存；陌生站（如
+`pageplay login www.newsite.com`）→ 打开贴的页面，你登录完成后回到终端
+按回车，pageplay 收取该域 cookie 保存。
 
 ### list：查看已登记站点
 

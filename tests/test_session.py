@@ -178,10 +178,39 @@ def test_open_returns_headful_context_and_close_releases(tmp_path):
 
     assert session.open() is context
     assert launcher.calls == [(tmp_path / "sites" / "taobao" / "browser-profile", False)]
+    assert context.pages == []  # 不给 url：不开页面、不导航（原行为）
 
     session.close()
     assert context.closed is True
     assert not (tmp_path / "sites" / "taobao" / ".session.lock").exists()
+
+
+def test_open_with_url_navigates_page(tmp_path):
+    """open(url)：起 context 后 new_page().goto(url)（贴网址登录入口）。"""
+    context = FakeContext([[]])
+    launcher = FakeLauncher(context)
+    session = make_session(tmp_path, launcher)
+
+    assert session.open("https://www.newsite.com") is context
+    assert context.pages[0].urls == ["https://www.newsite.com"]
+
+    session.close()
+    assert context.closed is True
+
+
+def test_write_meta_lands_schema_file(tmp_path):
+    """write_meta：公开方法，schema 同设计 §3，不依赖浏览器。"""
+    session = make_session(tmp_path, FakeLauncher(None))  # 被调用即炸：不碰浏览器
+    site_dir = tmp_path / "sites" / "taobao"
+    site_dir.mkdir(parents=True)
+
+    session.write_meta()
+
+    meta = json.loads((site_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["site"] == "taobao"
+    assert meta["login_url"] == SITE.login_url
+    assert meta["check_cookies"] == ["_tb_token_"]
+    assert "saved_at" in meta
 
 
 def test_forget_removes_site_dir(tmp_path):

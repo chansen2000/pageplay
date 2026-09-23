@@ -83,6 +83,34 @@ def resolve_site(name: str, login_url: str | None = None) -> SitePreset:
     )
 
 
+def parse_target(target: str) -> tuple[str, str | None]:
+    """把 login 的目标参数解析成 (站点名, 贴入的URL)。
+
+    - target 含 "://" 或含 "."：视为 URL/域名，无 scheme 补 "https://"；
+      站点名 = 注册域（最后两段近似）去掉最后一段（"www.taobao.com"→
+      "taobao"，多段公共后缀局限同 resolve_site）；login_url = 补全后的
+      完整 URL 原样返回
+    - 否则视为站点名，首尾空白剥掉后原样返回，login_url=None
+    - 空串/纯空白 raise ValueError；带点但解析不出合法域名同样 raise
+      ValueError（下游 resolve_site 对此类 URL 也会拒绝）
+    """
+    if not target or not target.strip():
+        raise ValueError(
+            "目标不能为空；请给站点名（如 taobao）或网址/域名（如 www.taobao.com）")
+    target = target.strip()
+    if "://" not in target and "." not in target:
+        return target, None
+
+    url = target if "://" in target else f"https://{target}"
+    hostname = urlsplit(url).hostname or ""
+    segments = hostname.split(".")
+    if "." not in hostname or not all(segments):
+        raise ValueError(
+            f"无法从目标解析出域名：{target!r}；"
+            f"请给形如 www.taobao.com 或 https://example.com/login 的合法目标")
+    return segments[-2], url
+
+
 def list_builtin() -> list[SitePreset]:
     """列出全部内置站点预设。"""
     return list(_BUILTIN.values())
