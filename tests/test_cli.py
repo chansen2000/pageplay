@@ -51,7 +51,11 @@ class StubContext:
 
 
 def install_stub_session(monkeypatch: pytest.MonkeyPatch, **behaviors):
-    """把 cli 里的 SiteSession 换成替身，返回"已创建实例"列表供断言。"""
+    """把 cli 里的 SiteSession 换成替身，返回"已创建实例"列表供断言。
+
+    顺带把 ensure_headful_browser 打桩为返回 None（login 自动档的前置
+    附着，替身场景不起真浏览器）。
+    """
     import pageplay.cli as cli
 
     from pageplay.cookies import save_snapshot
@@ -102,6 +106,7 @@ def install_stub_session(monkeypatch: pytest.MonkeyPatch, **behaviors):
                 raise behaviors["forget"]
 
     monkeypatch.setattr(cli, "SiteSession", StubSession)
+    monkeypatch.setattr(cli, "ensure_headful_browser", lambda: None)
     return created
 
 
@@ -140,7 +145,7 @@ def test_list_shows_saved_custom_site(home_dir, capsys):
 # ----------------------------------------------------------------------
 
 def test_login_timeout_returns_one(home_dir, fake_site, monkeypatch, capsys):
-    created = install_stub_session(monkeypatch, login=False)
+    created = install_stub_session(monkeypatch, login=False, verify=False)
     url = fake_site + "/login"
 
     rc = main(["login", "mysite", "--url", url, "--timeout", "0"])
@@ -155,12 +160,23 @@ def test_login_timeout_returns_one(home_dir, fake_site, monkeypatch, capsys):
 
 
 def test_login_success_returns_zero_and_next_commands(home_dir, monkeypatch, capsys):
-    install_stub_session(monkeypatch, login=True)
+    install_stub_session(monkeypatch, login=True, verify=False)
 
     assert main(["login", "taobao"]) == 0
     out = capsys.readouterr().out
     assert "taobao" in out and "登录成功" in out
     assert "doctor taobao" in out and "export taobao" in out  # 后续命令指引
+
+
+def test_login_skips_when_login_state_valid(home_dir, monkeypatch, capsys):
+    """"已登录捷径：doctor 语义通过 → 提示无需重复登录，不开登录页。"""
+    created = install_stub_session(monkeypatch, login=True, verify=True)
+
+    assert main(["login", "taobao"]) == 0
+    (session,) = created
+    assert session.login_calls == []  # 没走登录页流程
+    out = capsys.readouterr().out
+    assert "登录态仍有效，无需重复登录" in out
 
 
 # ----------------------------------------------------------------------
@@ -174,7 +190,7 @@ def _enter_cookie(domain: str = "newsite.com") -> dict:
 
 def test_login_pasted_builtin_url_keeps_preset_polling(home_dir, monkeypatch, capsys):
     """贴 www.taobao.com：命中 taobao 预设（标记保留），打开贴的页面。"""
-    created = install_stub_session(monkeypatch, login=True)
+    created = install_stub_session(monkeypatch, login=True, verify=False)
 
     assert main(["login", "www.taobao.com"]) == 0
 
@@ -190,7 +206,7 @@ def test_login_pasted_builtin_url_keeps_preset_polling(home_dir, monkeypatch, ca
 
 def test_login_preset_name_still_auto_without_url(home_dir, monkeypatch, capsys):
     """预设名兼容：login taobao 走原自动档，url=None（用预设 login_url）。"""
-    created = install_stub_session(monkeypatch, login=True)
+    created = install_stub_session(monkeypatch, login=True, verify=False)
 
     assert main(["login", "taobao"]) == 0
     (session,) = created
@@ -419,3 +435,23 @@ def test_unsaved_site_name_returns_one_with_login_hint(home_dir, capsys):
     assert "还没有登录记录" in err
     assert "pageplay login no-such-site" in err
     assert "已存站点" in err and "内置：sycm, taobao" in err
+
+
+# ----------------------------------------------------------------------
+# shutdown：关闭常驻浏览器守护
+# ----------------------------------------------------------------------
+
+def test_shutdown_with_live_daemon_reports_closed(home_dir, monkeypatch, capsys):
+    import pageplay.cli as cli
+
+    monkeypatch.setattr(cli, "shutdown_browser", lambda: True)
+    assert main(["shutdown"]) == 0
+    assert "常驻浏览器已关闭" in capsys.readouterr().out
+
+
+def test_shutdown_without_daemon_is_noop_zero(home_dir, monkeypatch, capsys):
+    import pageplay.cli as cli
+
+    monkeypatch.setattr(cli, "shutdown_browser", lambda: False)
+    assert main(["shutdown"]) == 0
+    assert "没有常驻浏览器" in capsys.readouterr().out

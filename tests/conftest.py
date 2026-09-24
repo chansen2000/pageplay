@@ -80,6 +80,26 @@ def _isolate_real_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PAGEPLAY_HOME", str(tmp_path / "pageplay-home-autouse"))
 
 
+@pytest.fixture
+def _daemon_cleanup():
+    """兜底收尾：测试结束后关掉常驻守护，并收掉测试进程内的 playwright 驱动。
+
+    生产里 CLI 进程退出即带走驱动；测试进程同线程复用会撞上仍活的
+    asyncio loop（"Sync API inside asyncio loop"），必须显式收掉。
+    守护浏览器本身已脱离父进程，shutdown_browser 走 pid 终止。
+    """
+    yield
+    from pageplay import session as _session
+
+    _session.shutdown_browser()
+    driver, _session._PW = _session._PW, None
+    if driver is not None:
+        try:
+            driver.stop()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # T7b：表格/下载假站（actions 执行器测试用，T7d run 流程同样消费）
 # ---------------------------------------------------------------------------
@@ -204,6 +224,107 @@ def nav_site():
     风格与 fake_site / table_site 一致。
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), _NavSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# T10：风控协作假站（登录反弹 → 人过验证 → 自动续跑）
+# ---------------------------------------------------------------------------
+
+_COLLAB_LOGIN_HTML = """<html><body>
+<h1>安全验证</h1>
+<p>滑块验证：请拖动滑块完成拼图</p>
+<script>setTimeout(function () {{ location.href = "{pass_url}"; }}, 600);</script>
+</body></html>"""
+
+_COLLAB_HOME_HTML = """<html><body>
+<h1>站点首页</h1>
+<script>setTimeout(function () {{ location.href = "{pass_url}"; }}, 600);</script>
+</body></html>"""
+
+_COLLAB_TABLE_HTML = """<html><body>
+<h1>订单列表</h1>
+<table id="data">
+  <thead><tr><th>名称</th><th>价格</th></tr></thead>
+  <tbody>
+    <tr><td>商品1</td><td>10</td></tr>
+    <tr><td>商品2</td><td>20</td></tr>
+  </tbody>
+</table>
+</body></html>"""
+
+
+class _CollabSiteHandler(BaseHTTPRequestHandler):
+    """风控协作假站（双主机方案）。
+
+    中性主机 = 127.0.0.1:<port>（本 fixture 的 base_url）：/table 未带
+    cookie 时 302 到 http://login.localhost:<port>/login——落点 host 含
+    "login."，run 的登录反弹判定命中。滑块页 600ms 后跳 /pass（绝对地址
+    回中性主机），/pass 回 Set-Cookie sessionid——"人过验证"后登录标记
+    出现在中性域，与真人滑块通过后 cookie 落袋同一可观测量（sync API
+    禁跨线程，不另起线程碰 playwright）。
+    """
+
+    def _port(self) -> int:
+        return self.server.server_address[1]
+
+    def do_GET(self) -> None:
+        port = self._port()
+        neutral = f"http://127.0.0.1:{port}"
+        logged_in = "sessionid=" in (self.headers.get("Cookie") or "")
+        if self.path.startswith("/table"):
+            if logged_in:
+                self._send_html(200, _COLLAB_TABLE_HTML)
+            else:
+                self.send_response(302)
+                self.send_header("Location", f"http://login.localhost:{port}/login")
+                self.end_headers()
+        elif self.path.startswith("/login"):
+            self._send_html(200, _COLLAB_LOGIN_HTML.format(pass_url=neutral + "/pass"))
+        elif self.path.startswith("/home"):
+            self._send_html(200, _COLLAB_HOME_HTML.format(pass_url=neutral + "/pass"))
+        elif self.path.startswith("/pass"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Set-Cookie", "sessionid=collab123; Path=/")
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass  # 静默：不把假站访问日志刷进测试输出
+
+
+@pytest.fixture
+def collab_site():
+    """起风控协作假站（端口 0），yield 中性 base_url 字符串，测完关停。
+
+    路由（中性主机视角）：GET /table 带 sessionid → 表格页（id="data"），
+    未带 → 302 http://login.localhost:<port>/login（反弹落点）；GET /login
+    → 滑块页（延时跳中性 /pass 种 cookie）；GET /home → 落地页（同）；
+    GET /pass → Set-Cookie sessionid。风格与 fake_site 等一致。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CollabSiteHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

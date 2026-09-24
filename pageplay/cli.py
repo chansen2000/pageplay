@@ -1,10 +1,16 @@
-"""命令行入口：解析九个子命令并派发到站点/会话/快照/recipe 模块。
+"""命令行入口：解析十一个子命令并派发到站点/会话/快照/recipe 模块。
 
 站点解析：所有命令同用 parse_target——login 支持直接贴网址/域名，
 贴 URL 命中内置预设走自动轮询、陌生站走"人工按回车"交互；预设名与
 --url 用法保持兼容。其余命令（doctor/export/open/forget/recipes）
 贴 URL 时只推导站点名（与 login 落盘一致），按"已存 meta.json 优先
 → 内置预设"解析；pick 同样解析但会打开贴的 URL（没贴则开 home_url）。
+pick/run/results 的处理函数在 cli_pick 模块（本文件只留注册与既有
+命令），_build_parser 内延迟 import——cli_pick 反向经模块属性取本文件
+的共享底层，顶层互不 import 才没有循环依赖。
+常驻模型（设计 §11）：浏览器是脱离的守护进程，命令经 session 模块
+附着干活、完事关页；人关窗（有头）或 shutdown 命令（无头守护）是
+唯一退出。
 顶层异常统一映射退出码：0 成功 / 1 业务失败 / 2 风控 / 130 用户中断。
 输出一律业务语言，不 dump 原始 dict。
 """
@@ -15,18 +21,14 @@ import argparse
 import json
 import os
 import sys
-import time
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-from . import actions, picker, recipes
+from . import recipes
 from .cookies import export_json, filter_by_domain
 from .guard import RiskTriggered
 from .logging_setup import setup_logging
-from .session import SiteSession
+from .session import SiteSession, ensure_headful_browser, shutdown_browser
 from .sites import SitePreset, get_site, list_builtin, parse_target, resolve_site
 
 _STATE_FILENAME = "state.json"
@@ -159,6 +161,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
     两档：贴的目标命中内置预设（注册域对上）→ 自动档，沿用该预设
     check_cookies 轮询、打开贴的页面；陌生站 → 回车档，人工按回车后
     收该域 cookie（有 cookie 即保存）。预设名与 --url 用法不变。
+    自动档先做 doctor 语义验活：登录态仍有效就不折腾人，直接提示。
     """
     try:
         name, pasted_url = parse_target(args.site)
@@ -181,6 +184,10 @@ def _cmd_login(args: argparse.Namespace) -> int:
         _login_by_enter(session, effective_url)  # 回车档：陌生站
     else:
         # 自动档：预设名 / --url 自定义 / 贴 URL 命中预设（打开贴的页面）
+        ensure_headful_browser()  # 登录必须有人：先保证有头活窗（无头守护换成有头）
+        if session.verify():
+            print(f"{site.name}：登录态仍有效，无需重复登录")
+            return 0
         print(f"正在打开 {site.name} 登录页，请在浏览器窗口里完成登录"
               f"（滑块/扫码自行通过），最长等待 {args.timeout} 秒…")
         if not session.login(timeout_sec=args.timeout,
@@ -188,8 +195,8 @@ def _cmd_login(args: argparse.Namespace) -> int:
             hint = f"pageplay login {site.name}"
             if args.url:
                 hint += f" --url {args.url}"
-            print(f"{site.name}：超时未检测到登录态，浏览器已关闭。"
-                  f"请重跑 {hint} 再试一次。", file=sys.stderr)
+            print(f"{site.name}：超时未检测到登录态。浏览器窗口保持打开，"
+                  f"可重跑 {hint} 再试一次。", file=sys.stderr)
             return 1
     print(f"{site.name}：登录成功，登录态已保存到 {_site_dir(site.name)}")
     print(f"后续可用：pageplay doctor {site.name} ｜ "
@@ -266,22 +273,29 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_open(args: argparse.Namespace) -> int:
-    """open：以持久档案打开 headful 浏览器，阻塞到 Ctrl-C，结束必清理。"""
+    """open：附着（或起）有头常驻浏览器并打开站点首页，命令即返不阻塞。
+
+    常驻模型（设计 §11）：窗口人开人关——本命令只负责"开"，窗口保持
+    打开，后续命令自动附到同一窗口；关窗或 pageplay shutdown 即结束。
+    """
     site = _resolve_site_or_report(args.site)
     if site is None:
         return 1
     session = SiteSession(site, _sites_root())
-    session.open()
-    try:
-        print(f"{site.name}：浏览器已打开（带登录态档案），可交给 AI 驱动；"
-              f"操作完成后按 Ctrl-C 结束")
-        while True:
-            time.sleep(60)  # 阻塞驻留；KeyboardInterrupt 即退出信号
-    except KeyboardInterrupt:
-        print(f"{site.name}：浏览器已关闭")
-        return 0
-    finally:
-        session.close()
+    session.open(site.home_url)
+    print(f"{site.name}：浏览器窗口已打开并停在首页，窗口会一直保持")
+    print("后续命令（doctor/pick/run…）会自动附到同一窗口；")
+    print("关闭：直接关掉窗口，或执行 pageplay shutdown")
+    return 0
+
+
+def _cmd_shutdown(args: argparse.Namespace) -> int:
+    """shutdown：关闭常驻浏览器守护（无头定时场景收尾用；人关窗等价）。"""
+    if shutdown_browser():
+        print("常驻浏览器已关闭（session.json 已清理）")
+    else:
+        print("当前没有常驻浏览器")
+    return 0
 
 
 def _cmd_forget(args: argparse.Namespace) -> int:
@@ -300,7 +314,7 @@ def _cmd_forget(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------
-# v0.2 三命令：pick（框选诉求）/ run（确定性重放）/ recipes（清单）
+# v0.2 recipes 清单（pick/run/results 处理函数在 cli_pick 模块）
 # ----------------------------------------------------------------------
 
 def _recipe_site_dirs() -> list[Path]:
@@ -309,94 +323,6 @@ def _recipe_site_dirs() -> list[Path]:
     if not root.is_dir():
         return []
     return sorted(p for p in root.iterdir() if (p / "recipes").is_dir())
-
-
-def _print_locked(result: dict) -> None:
-    """pick 的 on_confirm 钩子：确认瞬间把锁定结果回显给人。"""
-    print(f"已锁定 {result['action']}：{result['selector']}")
-
-
-def _cmd_pick(args: argparse.Namespace) -> int:
-    """pick：起带登录态浏览器，人框选表格/元素，保存 recipe + 封面图。
-    解析同 doctor（已存优先）；框选/截图在 picker 模块，这里只接线；
-    recipe 的 url 记实际落点 page.url，封面存 recipes/<名>.png。
-    """
-    try:
-        _name, pasted_url = parse_target(args.site)
-        site = _resolve_target(args.site)
-    except (KeyError, ValueError) as exc:
-        print(f"站点解析失败：{exc}", file=sys.stderr)
-        return 1
-    site_dir = _site_dir(site.name)
-    session = SiteSession(site, _sites_root())
-    try:
-        page = session.open().new_page()
-        page.goto(pasted_url or site.home_url)
-        picked = picker.run_pick(page, _print_locked)
-        name = args.name or f"{site.name}-{len(recipes.list_recipes(site_dir)) + 1}"
-        recipe = {"version": 1, "name": name, "site": site.name,
-                  "url": page.url, "action": picked["action"],
-                  "selector": picked["selector"], "columns": picked["columns"],
-                  "screenshot": f"{name}.png"}
-        recipes.save_recipe(site_dir, recipe)
-        picker.cover_screenshot(page, picked["selector"],
-                                site_dir / "recipes" / f"{name}.png")
-    except picker.PickCancelled as exc:
-        print(f"已取消：{exc}")
-        return 1
-    finally:
-        session.close()
-    print(f"recipe 已保存：{name}（站点 {site.name}）")
-    print(f"以后一条命令重放：pageplay run {name}")
-    return 0
-
-
-def _cmd_run(args: argparse.Namespace) -> int:
-    """run：跨站找 recipe 重放（默认 headless，--show 有头），打印产物。
-
-    recipe 名不分局：各站 recipes/ 依次找，找不到列出现有名字；选择器
-    15s 等不到提示重新 pick；抓表 CSV+JSON 双份（文件名带时间戳），
-    下载存原文件名。产物目录缺省 ~/Downloads/pageplay/<recipe名>/。
-    """
-    site_dir = next((d for d in _recipe_site_dirs()
-                     if (d / "recipes" / f"{args.name}.json").is_file()), None)
-    if site_dir is None:
-        names = sorted(str(r["name"]) for d in _recipe_site_dirs()
-                       for r in recipes.list_recipes(d))
-        known = "、".join(names) if names else "（一个都没有）"
-        print(f"recipe {args.name!r} 不存在；现有 recipe：{known}", file=sys.stderr)
-        return 1
-    recipe = recipes.load_recipe(site_dir, args.name)
-    try:
-        site = _resolve_target(recipe["site"])
-    except KeyError as exc:
-        print(f"recipe 所属站点解析失败：{exc}", file=sys.stderr)
-        return 1
-    out_dir = (Path(args.out).expanduser() if args.out
-               else Path.home() / "Downloads" / "pageplay" / recipe["name"])
-    session = SiteSession(site, _sites_root())
-    try:
-        page = session.open(headless=not args.show).new_page()
-        page.goto(recipe["url"])
-        actions.check_page_risk(page.content())
-        try:
-            page.wait_for_selector(recipe["selector"], timeout=15000)
-        except PlaywrightTimeoutError:
-            print(f"页面结构可能变了，请重新 pick {site.name}", file=sys.stderr)
-            return 1
-        if recipe["action"] == "table":
-            rows = actions.extract_table(page, recipe["selector"],
-                                         recipe.get("columns"))
-            stem = f"{recipe['name']}-{datetime.now():%Y%m%d-%H%M%S}"
-            products = list(actions.save_table(rows, out_dir, stem=stem))
-        else:
-            products = [actions.download_element(page, recipe["selector"],
-                                                 out_dir)]
-    finally:
-        session.close()
-    for product in products:
-        print(f"已生成 {product.resolve()}")
-    return 0
 
 
 def _cmd_recipes(args: argparse.Namespace) -> int:
@@ -425,7 +351,14 @@ def _cmd_recipes(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    """构建带六个子命令的 argparse 解析器。"""
+    """构建带十个子命令的 argparse 解析器。
+
+    pick/run/results 处理函数在 cli_pick 模块，这里函数内延迟 import：
+    cli_pick 反向要取本模块的共享底层（含测试替身 monkeypatch 的
+    SiteSession），顶层互不 import 才能保证任何导入顺序都不循环。
+    """
+    from .cli_pick import _cmd_pick, _cmd_results, _cmd_run
+
     parser = argparse.ArgumentParser(
         prog="pageplay",
         description="通用网站会话工具：人登录一次，AI 拿 cookie 或驱动浏览器",
@@ -467,9 +400,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--name", default=None, help="recipe 名（默认 <站点>-<序号>）")
     p_pick.set_defaults(func=_cmd_pick)
 
-    p_run = sub.add_parser("run", help="重放 recipe：headless 抓表或下载")
+    p_run = sub.add_parser("run", help="重放 recipe：抓表或下载（默认附着有头活窗）")
     p_run.add_argument("name", help="recipe 名（pageplay recipes 可查）")
-    p_run.add_argument("--show", action="store_true", help="有头运行（默认 headless）")
+    p_run.add_argument("--headless", action="store_true",
+                       help="用无头守护跑（定时任务场景；无头时无法人工协助风控）")
     p_run.add_argument("--out", default=None,
                        help="产物目录（默认 ~/Downloads/pageplay/<recipe名>）")
     p_run.set_defaults(func=_cmd_run)
@@ -478,6 +412,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_recipes.add_argument("site", nargs="?", default=None,
                            help="只列该站点（缺省列全部站点）")
     p_recipes.set_defaults(func=_cmd_recipes)
+
+    p_results = sub.add_parser("results", help="回看历史执行记录（✓✗ 与产物路径）")
+    p_results.add_argument("recipe", nargs="?", default=None,
+                           help="只看该 recipe 的记录（缺省看全部）")
+    p_results.add_argument("--limit", type=int, default=20,
+                           help="最多显示条数（默认 20）")
+    p_results.set_defaults(func=_cmd_results)
+
+    p_shutdown = sub.add_parser("shutdown", help="关闭常驻浏览器守护")
+    p_shutdown.set_defaults(func=_cmd_shutdown)
 
     return parser
 

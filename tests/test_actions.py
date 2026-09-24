@@ -15,6 +15,7 @@ from pageplay.actions import (
     check_page_risk,
     download_element,
     extract_table,
+    file_size_str,
     save_table,
 )
 from pageplay.guard import RiskTriggered
@@ -68,6 +69,30 @@ def test_save_table_empty_rows(tmp_path: Path):
     csv_path, json_path = save_table([], tmp_path, "empty")
     assert json.loads(json_path.read_text(encoding="utf-8")) == []
     assert csv_path.read_bytes().decode("utf-8-sig").strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# file_size_str（纯逻辑：产物大小人话，T9b）
+# ---------------------------------------------------------------------------
+
+def test_file_size_str_bytes_kb_mb(tmp_path: Path):
+    """三档：<1KB 整数字节；KB/MB 一位小数（1024 进位）。"""
+    small = tmp_path / "small.bin"
+    small.write_bytes(b"x" * 812)
+    assert file_size_str(small) == "812 B"
+
+    mid = tmp_path / "mid.bin"
+    mid.write_bytes(b"x" * 1229)  # 1229 / 1024 = 1.2 KB
+    assert file_size_str(mid) == "1.2 KB"
+
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 3_565_158)  # 3.4 MB
+    assert file_size_str(big) == "3.4 MB"
+
+
+def test_file_size_str_missing_file_returns_zero_bytes(tmp_path: Path):
+    """文件不存在 → "0 B"，不抛。"""
+    assert file_size_str(tmp_path / "no-such.bin") == "0 B"
 
 
 # ---------------------------------------------------------------------------

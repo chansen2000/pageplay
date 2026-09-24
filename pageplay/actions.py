@@ -117,3 +117,22 @@ def download_element(page, selector: str, out_dir: Path) -> Path:
     download.save_as(str(target))
     logger.info("download_element: %s 已保存 %s", download.suggested_filename, target)
     return target
+
+
+def file_size_str(path: Path) -> str:
+    """文件大小的人话表达："812 B" / "1.2 KB" / "3.4 MB"（1024 进位）。
+
+    文件不存在或不可读（OSError）→ "0 B"；<1KB 不带小数，其余一位小数。
+    """
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return "0 B"
+    if size < 1024:
+        return f"{size} B"
+    size_f = float(size)
+    for unit in ("KB", "MB", "GB", "TB"):
+        size_f /= 1024
+        if size_f < 1024 or unit == "TB":
+            return f"{size_f:.1f} {unit}"
+    return f"{size_f:.1f} TB"  # 循环必经 return，此处仅为静态检查兜底

@@ -5,9 +5,10 @@
 加载时自动布防（跨页存活），当前已加载文档再补一次 evaluate；人确认
 后 JS 调 window.__pageplay_onconfirm（expose_function 绑定跨文档持续
 有效）→ python 收 payload → 用 COLLECT_CHAIN_JS 收集锁定元素到根的
-链 → selector_from_chain 生成正式 selector → 组装返回。覆层 JS 自带
-心跳自愈（同文档内 SPA 剥 DOM/软跳转后自动重新布防）。全程不改页面
-业务 DOM（只 append 覆层/面板，结束移除）。
+链 → selector_from_chain 生成正式 selector → 组装并回调 on_confirm。
+覆层 JS 自带心跳自愈（同文档内 SPA 剥 DOM/软跳转后自动重新布防）。
+全程不改页面业务 DOM（只 append 覆层/面板，结束移除）。repeat=True
+转会话常驻（T9a）：确认后清场重布防连续框选，人关窗 / Ctrl-C 才结束。
 
 链序约定（selector_from_chain 与 COLLECT_CHAIN_JS 一致）：根在首、
 目标元素在尾，与生成选择器的书写方向相同。
@@ -15,9 +16,12 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "PickCancelled",
@@ -312,7 +316,7 @@ def overlay_js() -> str:
 
 
 class PickCancelled(RuntimeError):
-    """人取消了拾取（Esc / 窗口关闭 / 超时无人确认）。"""
+    """人取消了拾取（Esc / 窗口关闭 / 超时无人确认 / Ctrl-C 且无已确认记录）。"""
 
 
 # 当前拾取会话状态。expose_function 绑定随页面存活、不可换回调，故 shim
@@ -349,8 +353,22 @@ def _ensure_bindings(page) -> None:
             raise  # 非重复安装类错误：如实上抛，不吞
 
 
-def run_pick(page, on_confirm) -> dict:
-    """注入框选覆层，等人确认，返回组装结果并回调 on_confirm。
+def _rearm(page) -> None:
+    """确认/Esc 后换防：重注全新覆层实例（IIFE 首行自清旧实例，幂等）。
+
+    不抹 __pageplay_locked：on_confirm 长操作期间人可能已确认下一条
+    （跨页时由 init script 自动布防），锁定元素要留给下一轮收集。
+    页面恰在此刻被关则 evaluate 必失败——吞掉即可，随后的
+    wait_for_timeout 会如实按"页面已关闭"收尾。
+    """
+    try:
+        page.evaluate(overlay_js())
+    except Exception:
+        pass
+
+
+def run_pick(page, on_confirm, repeat: bool = False) -> dict | list[dict]:
+    """注入框选覆层等人确认，组装结果并回调 on_confirm。
 
     流程：add_init_script(overlay_js)——每个新文档加载时自动布防（跨页
     存活的关键），随后对当前已加载文档补一次 evaluate（同一份 JS 幂等；
@@ -358,44 +376,88 @@ def run_pick(page, on_confirm) -> dict:
     expose 绑定收 payload，跨文档持续有效）→ page.evaluate
     (COLLECT_CHAIN_JS) 收集锁定元素到根的链 → selector_from_chain 生成
     正式 selector → 组装 {"selector","action","columns","rect","url"} →
-    调 on_confirm(结果)（cli 落盘/确认打印钩子）→ 返回。
+    调 on_confirm(结果)（cli 落盘/确认打印钩子）。
+
+    repeat=False（默认，T7c 行为不变）：一次确认 → 返回该条 dict；
+    Esc / 窗口关闭 / 超时无人确认 raise PickCancelled（超时自进入拾取
+    起算，跨页导航不重置）。
+
+    repeat=True（T9a 会话常驻，"结束由人来定"）：每次确认 → 调
+    on_confirm(payload) → 清场重布防继续框选 → 返回全部确认记录
+    list[dict]（按序）。会话级退出条件（返回前都走 finally 清场）：
+    - 浏览器窗口被用户关闭（既有 Page/Context closed 路径）：已收
+      ≥1 条正常返回已收列表（不抛）；一条没收 → PickCancelled
+    - 空闲超时：deadline 每轮确认后刷新（用户浏览多久都行，只要每
+      600s 内有一次交互）；已收 ≥1 条正常返回并 log 说明；一条没收
+      → PickCancelled
+    - 终端 Ctrl-C（KeyboardInterrupt）：已收 ≥1 条正常返回；一条没收
+      → PickCancelled
+    Esc 语义不变：只取消当前锁定/面板，不退出会话（repeat 下清场重
+    布防继续等）。on_confirm 抛异常不吞、向上透传（cli 执行失败要
+    显示）。"已收"以 on_confirm 完整走完计，被打断的那条不算。
 
     url 语义 = 用户点确认那一刻的 location.href（跨页框选时即实际落点
     页 URL），与 cli 记账用的 page.url 同文档取值一致；payload 缺 url
-    时兜底 page.url。
-
-    Esc / 窗口关闭 / 超时无人确认 raise PickCancelled（超时自进入拾取
-    起算，跨页导航不重置）。返回前覆层已清理，页面业务 DOM 不留痕。
+    时兜底 page.url。返回前覆层已清理，页面业务 DOM 不留痕。
     """
     state = {"event": threading.Event(), "cancelled": False, "payload": None}
     _ACTIVE["state"] = state
     _ensure_bindings(page)
+    results: list[dict] = []
     try:
         page.add_init_script(overlay_js())  # 新文档自动布防（跨页存活）
         page.evaluate(overlay_js())         # 当前文档补注入（幂等）
         deadline = time.monotonic() + _PICK_TIMEOUT_SEC
-        while not state["event"].is_set():
-            if time.monotonic() >= deadline:
-                raise PickCancelled(f"拾取超时（{_PICK_TIMEOUT_SEC}s 无人确认）")
-            try:
-                # 等待期间 playwright 派发绑定回调（confirm/cancel 经此进入）
-                page.wait_for_timeout(100)
-            except Exception as exc:
-                raise PickCancelled(f"页面已关闭，拾取中止：{exc}") from exc
-        if state["cancelled"]:
-            raise PickCancelled("人按 Esc 取消了框选")
-        payload = state["payload"] or {}
-        chain = page.evaluate(COLLECT_CHAIN_JS)
-        selector = selector_from_chain(chain)
-        result = {
-            "selector": selector,
-            "action": payload.get("action"),
-            "columns": payload.get("columns"),
-            "rect": payload.get("rect"),
-            "url": payload.get("url") or page.url,
-        }
-        on_confirm(result)
-        return result
+        while True:
+            # 内层循环 = 等一条确认（repeat 的外层会话在 while True）
+            while not state["event"].is_set():
+                if time.monotonic() >= deadline:
+                    if repeat and results:
+                        log.info("拾取空闲超时（%ds 无交互），返回已确认的 %d 条",
+                                 _PICK_TIMEOUT_SEC, len(results))
+                        return results
+                    raise PickCancelled(f"拾取超时（{_PICK_TIMEOUT_SEC}s 无人确认）")
+                try:
+                    # 等待期间 playwright 派发绑定回调（confirm/cancel 经此进入）
+                    page.wait_for_timeout(100)
+                except Exception as exc:
+                    if repeat and results:
+                        log.info("页面被关闭，返回已确认的 %d 条", len(results))
+                        return results
+                    raise PickCancelled(f"页面已关闭，拾取中止：{exc}") from exc
+            if state["cancelled"]:
+                if not repeat:
+                    raise PickCancelled("人按 Esc 取消了框选")
+                # repeat：Esc 只取消本轮锁定/面板，清场重布防继续等
+                state["cancelled"] = False
+                state["event"].clear()
+                _rearm(page)
+                deadline = time.monotonic() + _PICK_TIMEOUT_SEC
+                continue
+            payload = state["payload"] or {}
+            chain = page.evaluate(COLLECT_CHAIN_JS)
+            # 先复位握手再进 on_confirm：回调长操作期间人确认的下一条
+            # 照常经绑定入队（event+payload+__pageplay_locked），不丢
+            state["payload"] = None
+            state["event"].clear()
+            result = {
+                "selector": selector_from_chain(chain),
+                "action": payload.get("action"),
+                "columns": payload.get("columns"),
+                "rect": payload.get("rect"),
+                "url": payload.get("url") or page.url,
+            }
+            on_confirm(result)
+            results.append(result)
+            if not repeat:
+                return result
+            _rearm(page)  # 确认后明确清场再布防，等下一条
+            deadline = time.monotonic() + _PICK_TIMEOUT_SEC
+    except KeyboardInterrupt:
+        # 终端 Ctrl-C = 人结束会话：已收 ≥1 条正常返回，一条没收即取消
+        if not results:
+            raise PickCancelled("人 Ctrl-C 结束了框选（尚无已确认记录）")
+        return results if repeat else results[-1]
     finally:
         _ACTIVE["state"] = None
         try:
