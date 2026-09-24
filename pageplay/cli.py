@@ -1,4 +1,4 @@
-"""命令行入口：解析十三个子命令并派发到站点/会话/快照/recipe/流程模块。
+"""命令行入口：解析十四个子命令并派发到站点/会话/快照/recipe/流程模块。
 
 站点解析：所有命令同用 parse_target——login 支持直接贴网址/域名，
 贴 URL 命中内置预设走自动轮询、陌生站走"人工按回车"交互；预设名与
@@ -389,13 +389,14 @@ def _cmd_flows(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    """构建带十三个子命令的 argparse 解析器。
+    """构建带十四个子命令的 argparse 解析器。
 
-    pick/run/record/results 处理函数在 cli_pick 模块，这里函数内延迟
-    import：cli_pick 反向要取本模块的共享底层（含测试替身 monkeypatch
+    pick/run/record/results 在 cli_pick、grab 在 cli_grab，这里函数内
+    延迟 import：它们反向要取本模块的共享底层（含测试替身 monkeypatch
     的 SiteSession），顶层互不 import 才能保证任何导入顺序都不循环。
     """
     from .cli_pick import _cmd_pick, _cmd_record, _cmd_results, _cmd_run
+    from .cli_grab import register_grab
 
     parser = argparse.ArgumentParser(
         prog="pageplay",
@@ -412,8 +413,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_login.set_defaults(func=_cmd_login)
 
     p_list = sub.add_parser("list", help="列出已保存站点与内置预设")
-    p_list.add_argument("--json", action="store_true",
-                        help="stdout 打机读 JSON 数组（GUI 数据源）")
+    p_list.add_argument("--json", action="store_true", help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_list.set_defaults(func=_cmd_list)
 
     p_doctor = sub.add_parser("doctor", help="检查登录态是否仍有效")
@@ -473,12 +473,12 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="只看该 recipe 的记录（缺省看全部）")
     p_results.add_argument("--limit", type=int, default=20,
                            help="最多显示条数（默认 20）")
-    p_results.add_argument("--json", action="store_true",
-                           help="stdout 打机读 JSON 数组（GUI 数据源）")
+    p_results.add_argument("--json", action="store_true", help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_results.set_defaults(func=_cmd_results)
 
     p_shutdown = sub.add_parser("shutdown", help="关闭常驻浏览器守护")
     p_shutdown.set_defaults(func=_cmd_shutdown)
+    register_grab(sub)  # grab 的注册与实现同在 cli_grab 模块
 
     return parser
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from pageplay.cli import main
 from pageplay.cli_pick import _runs_path
 from pageplay.flows import load_flow, save_flow
@@ -150,6 +152,40 @@ def test_record_goto_bounce_reports_and_closes_page(home_dir, tmp_path,
 
     assert "登录态失效" in capsys.readouterr().err
     assert page.closed is True                          # finally 收页
+
+
+@pytest.mark.parametrize("prompt_error", [
+    EOFError("无终端可输入"),
+    UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+])
+def test_record_prompt_error_autosaves_with_default_name(
+        home_dir, tmp_path, monkeypatch, capsys, prompt_error):
+    """T13.1：起名处 EOF/解码失败（GUI/管道场景）→ 自动命名照常落盘。
+
+    以前这里是丢弃录制退出 1；现在改为用 next_flow_name 默认名保存并
+    明示，退出码 0——录制成果一分钟都不能丢。
+    """
+    _write_saved_site(home_dir)
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = RecordPage(_START, table=_TABLE)
+    install_browser(monkeypatch, page)
+
+    def fake_record_session(p, on_step, on_harvest):
+        on_step(_CLICK_STEP)
+        return [dict(_CLICK_STEP), dict(_HARVEST_STEP)]
+    monkeypatch.setattr("pageplay.recorder.record_session",
+                        fake_record_session)
+
+    def no_input(*a):
+        raise prompt_error
+
+    monkeypatch.setattr("builtins.input", no_input)
+    assert main(["record", "faketest"]) == 0
+    flow = load_flow(home_dir / "sites" / "faketest", "faketest-flow-1")
+    assert [s["kind"] for s in flow["steps"]] == ["click", "table"]
+    out = capsys.readouterr().out
+    assert "自动命名" in out and "faketest-flow-1" in out
+    assert "流程已保存：faketest-flow-1" in out
 
 
 # ----------------------------------------------------------------------

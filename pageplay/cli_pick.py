@@ -113,17 +113,23 @@ def _save_cover(page, result: dict, site_dir: Path, name: str) -> None:
 
 
 def _execute_and_record(page, name: str, action: str, selector: str,
-                        columns, out_dir: Path) -> list[Path] | None:
+                        columns, out_dir: Path,
+                        ledger_action: str | None = None) -> list[Path] | None:
     """当场执行一次动作并落账（pick 确认执行与 record 收获执行共用）。
 
     执行 → 打印 ✓（产物绝对路径+大小）或 ✗（人话原因）→ 结果无论成败
-    落账 runs.jsonl。执行失败不向上抛：单条失败不打断框选/录制会话；
-    成功返回产物路径列表，失败返回 None（调用方据此决定是否截封面）。
+    落账 runs.jsonl（ledger_action 给定时账本 action 记它——如 grab——
+    执行语义仍随 action 本身不变）。RiskTriggered 不吞、向上穿透（真
+    风控 = 停整条链，main 映射退出码 2）。其余执行失败不向上抛：单条
+    失败不打断框选/录制会话；成功返回产物路径列表，失败返回 None
+    （调用方据此决定是否截封面）。
     """
     recipe = {"name": name, "action": action, "selector": selector,
               "columns": columns}
     try:
         rows, products = _execute_recipe(page, recipe, out_dir)
+    except RiskTriggered:
+        raise  # 真风控：停整条链，不按单条失败处理
     except PlaywrightTimeoutError:
         detail, products = _DOWNLOAD_NO_FILE_HINT, None
     except Exception as exc:  # 抓表/下载/落盘任何失败：人话 ✗，会话继续
@@ -131,10 +137,10 @@ def _execute_and_record(page, name: str, action: str, selector: str,
     if products is not None:
         line = _report_products(action, rows, products)
         print(f"✓ {line}")
-        _record_run(name, action, "ok", line, products)
+        _record_run(name, ledger_action or action, "ok", line, products)
         return products
     print(f"✗ {detail}", file=sys.stderr)
-    _record_run(name, action, "fail", detail, [])
+    _record_run(name, ledger_action or action, "fail", detail, [])
     return None
 
 
@@ -319,10 +325,11 @@ def _cmd_record(args: argparse.Namespace) -> int:
         try:
             flow_name = (input(f"给这次流程起个名（回车 = {default_name} 默认）：")
                          .strip() or default_name)
-        except EOFError:
-            print("未输入流程名，本次录制未保存（上面已有步骤与产物）",
-                  file=sys.stderr)
-            return 1
+        except (EOFError, UnicodeDecodeError):
+            # 无终端可输入（GUI 子进程/管道跑 record，或 Ctrl-D 收尾）：
+            # 不丢录制，自动命名照常保存
+            flow_name = default_name
+            print(f"未输入名称，已自动命名为 {flow_name}")
     try:
         flows.save_flow(site_dir, {"version": 1, "name": flow_name,
                                    "site": site.name, "url": start_url,

@@ -8,8 +8,11 @@
 线程模型（tkinter 唯一安全做法）：子进程在后台 daemon 线程逐行读
 stdout → queue.Queue → 主线程 after(100ms) 轮询刷 UI；tkinter 控件只在
 主线程碰。运行期互斥：全部按钮 disabled + 状态栏"执行中…"；结束恢复并
-自动刷新下拉（flows/recipes --json 机读数组）。「取消」= terminate（等同
-Ctrl-C）；退出 GUI 时若子进程仍在跑，先 terminate 再关窗。
+自动刷新下拉（flows/recipes --json 机读数组）。「取消」= SIGINT（POSIX
+等同 Ctrl-C：record 走 KeyboardInterrupt 路径安全保存流程后再退，T13；
+3s 仍活才升级 terminate 兜底）；退出 GUI 时对在跑子进程同样先 SIGINT
+再关窗。「录制」名称留空自动起默认名并回填输入框（T13.3 防丢），启动
+时打三行录制提示。
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
+import signal
 import subprocess
 import sys
 import threading
@@ -35,11 +40,12 @@ _CLI_PREFIX = [sys.executable, "-c",
 # 能 import 到本包；已安装场景下 cwd 在此也不影响行为。
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# record 等命令要交互的路径都已有 EOFError 兜底；GUI 传 --name 走非交互
+# record 等命令要交互的路径都已有 EOFError 兜底（T13.1 自动命名保存）；
+# GUI 录制总是自动起名传 --name，起名交互在 GUI 里永远不出现
 _REQUIRES_SITE = frozenset({"login", "doctor", "open", "record", "export"})
 _OPERATIONS = frozenset({
     "login", "doctor", "open", "record", "run", "export",
-    "results", "flows", "recipes", "shutdown",
+    "results", "flows", "recipes", "shutdown", "grab",
 })
 
 
@@ -47,12 +53,13 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     """把 GUI 操作翻译成完整 pageplay argv（纯函数，单测锚点）。
 
     op ∈ {login, doctor, open, record, run, export, results, flows,
-    recipes, shutdown}；params 只认三个键：site_or_url（顶部站点/网址
+    recipes, shutdown, grab}；params 只认三个键：site_or_url（顶部站点/网址
     输入框）、name（名称输入框，record 时作 --name；run 时作重放名）、
     headless（run 时作 --headless）。多余的键忽略。
     - login/doctor/open/record/export 必填 site_or_url，缺 → ValueError
+    - grab 站点可选（给了才传：仅用于命名与落账归属）
     - run 必填 name（下拉选中的流程/recipe 名），缺 → ValueError
-    - record 有 name 才传 --name（不传走 CLI 默认命名）
+    - record 有 name 才传 --name（GUI 侧由 next_record_name 保证非空）
     - run 有 headless 才传 --headless
     非法 op → ValueError。
     """
@@ -69,6 +76,8 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     argv = [op]
     if op in _REQUIRES_SITE:
         argv.append(site)
+    if op == "grab" and site:  # 站点可选：给了才传
+        argv.append(site)
     if op == "run":
         argv.append(name)
         if params.get("headless"):
@@ -76,6 +85,34 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     elif op == "record" and name:
         argv += ["--name", name]
     return argv
+
+
+def next_record_name(site: str, known_flows) -> str:
+    """录制缺名时的默认流程名（T13.3 防丢）：<站>-flow-<N>。
+
+    站点标签与 CLI parse_target 同近似（www.taobao.com → taobao）；
+    N 从已知流程清单（flows --json 的产物，refresh_names 维护）里同
+    前缀最大号 +1；清单里没有同前缀（取不到 N）→ 时间戳后 4 位兜底。
+    站点推不出标签（空串等）返回 ""：调用方不自动命名，交
+    build_command 按缺站点报错。
+    """
+    host = site.strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/")[0].split(":")[0]
+    parts = [p for p in host.split(".") if p]
+    label = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+    if not label:
+        return ""
+    prefix = f"{label}-flow-"
+    max_no = 0
+    for flow_name in known_flows:
+        matched = re.fullmatch(re.escape(prefix) + r"(\d+)", str(flow_name))
+        if matched:
+            max_no = max(max_no, int(matched.group(1)))
+    if max_no:
+        return f"{prefix}{max_no + 1}"
+    return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')[-4:]}"
 
 
 class App:
@@ -134,7 +171,7 @@ class App:
                    ("打开窗口", "open"), ("录制", "record"), ("重放", "run"),
                    ("导出", "export"), ("结果", "results"),
                    ("流程列表", "flows"), ("recipe列表", "recipes"),
-                   ("关闭守护", "shutdown")]
+                   ("关闭守护", "shutdown"), ("取当前页", "grab")]
         for i, (label, op) in enumerate(actions):
             btn = ttk.Button(grid, text=label,
                              command=lambda op=op: self._launch(op))
@@ -166,6 +203,14 @@ class App:
                   "headless": bool(self.headless_var.get())}
         if op == "run":  # 重放：下拉选中值即名字（先流程后 recipe 由 CLI 双查）
             params["name"] = self.pick_var.get()
+        if op == "record" and not params["name"] and params["site_or_url"]:
+            # T13.3 防丢：名称留空自动起默认名并回填输入框——record 必带
+            # --name，CLI 的起名交互在 GUI 里永远不出现
+            auto = next_record_name(str(params["site_or_url"]),
+                                    self._names.get("flows", []))
+            if auto:
+                params["name"] = auto
+                self.name_var.set(auto)
         try:
             argv = build_command(op, params)
         except ValueError as exc:
@@ -187,6 +232,10 @@ class App:
         self._set_running(True)
         threading.Thread(target=self._pump, args=(self.proc,),
                          daemon=True).start()
+        if op == "record":  # T13：录制怎么停、录成什么名，先说清楚
+            self._log("录制中：正常浏览即记录，按 P 框选收获")
+            self._log("停止：关闭浏览器里该标签页，或点「取消」（会安全保存）")
+            self._log(f"流程名将用：{params['name'] or '（回车默认）'}")
 
     def _pump(self, proc: subprocess.Popen) -> None:
         """后台线程：逐行读子进程 stdout 入队；结束后投递 ("done", 码)。
@@ -225,15 +274,29 @@ class App:
         self.refresh_names()  # 结束自动刷新下拉（--json 机读）
 
     def _cancel(self) -> None:
+        """请求停止：SIGINT（POSIX 等同 Ctrl-C）让命令安全收尾——record
+        走 KeyboardInterrupt 路径把已录步骤存成流程再退（T13）。3s 后
+        仍活着才升级 terminate（收尾卡死兜底）。"""
         proc = self.proc
         if proc is None or proc.poll() is not None:
             return
         self.cancelled = True
         try:
-            proc.terminate()  # 等同 Ctrl-C
+            proc.send_signal(signal.SIGINT)
         except ProcessLookupError:
             pass  # 恰好已自己退出，done 消息稍后照常到达
-        self._log("已发送终止信号（等同 Ctrl-C）…")
+        self._log("已请求停止（等待安全收尾）…")
+        self.root.after(3000, self._escalate, proc)
+
+    def _escalate(self, proc: subprocess.Popen) -> None:
+        """3s 宽限到点：仍是同一子在跑才强杀（不误杀后来的新任务）。"""
+        if proc is not self.proc or proc.poll() is not None:
+            return  # 已退出或已被新任务取代：无事可做
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        self._log("收尾超时，已强制终止")
 
     def _set_running(self, running: bool) -> None:
         """互斥：运行中全部按钮 disabled（取消钮除外），状态栏提示。"""
@@ -281,10 +344,16 @@ class App:
         self.pick_box["values"] = merged
 
     def _on_close(self) -> None:
-        """退出 GUI：子进程还在跑就先 terminate（等同 Ctrl-C）再关窗。"""
+        """退出 GUI：子进程还在跑就先 SIGINT（安全收尾，录制不丢）再关窗。
+
+        关窗后子进程成为孤儿继续把收尾做完（流程落盘），无人再杀它。
+        """
         proc = self.proc
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
         self.root.destroy()
 
 
