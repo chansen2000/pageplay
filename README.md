@@ -78,21 +78,35 @@ pageplay pick taobao --name daily-orders   # 站点名/网址均可，--name 可
 `<名>-2`、`<名>-3`。每条确认即存 recipe + 当场执行 + 落账；会话结束打印
 摘要（收了几条、名字列表、产物目录）。
 
-### run：重放 recipe 拿产物
+### record：录一段操作，存为可整链重放的流程
 
 ```bash
-pageplay run daily-orders --out DIR      # 默认附着有头活窗
-pageplay run daily-orders --headless     # 定时任务：无头守护跑
+pageplay record taobao                     # 登录一次后，窗口里自然操作
+pageplay record taobao --name daily-flow   # 直接定流程名（默认 <站>-flow-N）
 ```
 
-产物默认 `~/Downloads/pageplay/<recipe名>/`（表 CSV+JSON 双份、下载存原始
-文件名）。被弹回登录页不直接停：等人过验证后自动续跑；选择器等不到提示
-重新 pick。结果无论成败落账。
+有头窗口里**自然浏览**：点击照常放行、自动记为路径步；按 P 进框选
+（现 pick 全套），确认产生收获步并当场执行落账。结束（关窗/Ctrl-C）
+给流程起个名（回车用默认）保存，以后 `pageplay run <名字>` 整链自动来一遍。
 
-### recipes / results / shutdown
+### run：按名字重放（先查流程，再查 recipe）
+
+```bash
+pageplay run daily-flow                # 流程：整链逐步自动重放
+pageplay run daily-orders --out DIR    # recipe：单条重放（原语义不变）
+pageplay run daily-orders --headless   # 定时任务：无头守护跑
+```
+
+名字先查流程（`flows/`）再查 recipe，两者都无则列出可用的名字。产物默认
+`~/Downloads/pageplay/<名字>/`（表 CSV+JSON 双份、下载存原始文件名）。被
+弹回登录页不直接停：等人过验证后自动续跑；流程某步等不到会报第 N 步卡住。
+结果无论成败落账（流程整链一条账）。
+
+### recipes / flows / results / shutdown
 
 ```bash
 pageplay recipes                  # 列 recipe；后跟站点名只看某站
+pageplay flows                    # 列流程（名字/步数/起始URL/创建时间）
 pageplay results                  # 执行账本回看（✓✗ 与产物路径，新在前）
 pageplay results daily-orders --limit 5
 pageplay shutdown                 # 关闭常驻浏览器守护（定时场景收尾）
@@ -108,7 +122,8 @@ pageplay shutdown                 # 关闭常驻浏览器守护（定时场景�
 └── sites/<site>/
     ├── state.json      # cookie 快照（0600）
     ├── meta.json       # 站点名/登录URL/保存时间/检测标记
-    └── recipes/        # pick 存的 recipe（json）+ 封面（png）
+    ├── recipes/        # pick 存的 recipe（json）+ 封面（png）
+    └── flows/          # record 存的流程（json，整链步骤）
 ```
 
 环境变量 `PAGEPLAY_HOME` 可把根目录指到任意位置：

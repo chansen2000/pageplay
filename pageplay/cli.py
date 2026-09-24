@@ -1,13 +1,13 @@
-"""命令行入口：解析十一个子命令并派发到站点/会话/快照/recipe 模块。
+"""命令行入口：解析十三个子命令并派发到站点/会话/快照/recipe/流程模块。
 
 站点解析：所有命令同用 parse_target——login 支持直接贴网址/域名，
 贴 URL 命中内置预设走自动轮询、陌生站走"人工按回车"交互；预设名与
---url 用法保持兼容。其余命令（doctor/export/open/forget/recipes）
+--url 用法保持兼容。其余命令（doctor/export/open/forget/recipes/flows）
 贴 URL 时只推导站点名（与 login 落盘一致），按"已存 meta.json 优先
-→ 内置预设"解析；pick 同样解析但会打开贴的 URL（没贴则开 home_url）。
-pick/run/results 的处理函数在 cli_pick 模块（本文件只留注册与既有
-命令），_build_parser 内延迟 import——cli_pick 反向经模块属性取本文件
-的共享底层，顶层互不 import 才没有循环依赖。
+→ 内置预设"解析；pick/record 同样解析但会打开贴的 URL（没贴则开
+home_url）。pick/run/record/results 的处理函数在 cli_pick 模块（本文件
+只留注册与既有命令），_build_parser 内延迟 import——cli_pick 反向经
+模块属性取本文件的共享底层，顶层互不 import 才没有循环依赖。
 常驻模型（设计 §11）：浏览器是脱离的守护进程，命令经 session 模块
 附着干活、完事关页；人关窗（有头）或 shutdown 命令（无头守护）是
 唯一退出。
@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import recipes
+from . import flows, recipes
 from .cookies import export_json, filter_by_domain
 from .guard import RiskTriggered
 from .logging_setup import setup_logging
@@ -314,7 +314,7 @@ def _cmd_forget(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------
-# v0.2 recipes 清单（pick/run/results 处理函数在 cli_pick 模块）
+# 清单命令（pick/run/record/results 处理函数在 cli_pick 模块）
 # ----------------------------------------------------------------------
 
 def _recipe_site_dirs() -> list[Path]:
@@ -323,6 +323,14 @@ def _recipe_site_dirs() -> list[Path]:
     if not root.is_dir():
         return []
     return sorted(p for p in root.iterdir() if (p / "recipes").is_dir())
+
+
+def _flow_site_dirs() -> list[Path]:
+    """sites 根下有 flows/ 目录的站点目录（排序稳定；record 落盘处）。"""
+    root = _sites_root()
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if (p / "flows").is_dir())
 
 
 def _cmd_recipes(args: argparse.Namespace) -> int:
@@ -346,18 +354,39 @@ def _cmd_recipes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_flows(args: argparse.Namespace) -> int:
+    """flows：列流程（名字/步数/起始URL/创建时间）；无参全部站，带参单站。"""
+    if args.site is not None:
+        site = _resolve_site_or_report(args.site)
+        if site is None:
+            return 1
+        site_dirs = [_site_dir(site.name)]
+    else:
+        site_dirs = _flow_site_dirs()
+    rows = [(d, f) for d in site_dirs for f in flows.list_flows(d)]
+    if not rows:
+        print("暂无流程。用 pageplay record <站点或网址> 录制第一个流程。")
+        return 0
+    width = max(len(str(f["name"])) for _d, f in rows)
+    print("已保存流程：")
+    for _d, f in rows:
+        print(f"  {str(f['name']):<{width}}  {f['step_count']} 步  {f['url']}"
+              f"  创建于 {f['created_at']}")
+    return 0
+
+
 # ----------------------------------------------------------------------
 # 参数解析与入口
 # ----------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    """构建带十个子命令的 argparse 解析器。
+    """构建带十三个子命令的 argparse 解析器。
 
-    pick/run/results 处理函数在 cli_pick 模块，这里函数内延迟 import：
-    cli_pick 反向要取本模块的共享底层（含测试替身 monkeypatch 的
-    SiteSession），顶层互不 import 才能保证任何导入顺序都不循环。
+    pick/run/record/results 处理函数在 cli_pick 模块，这里函数内延迟
+    import：cli_pick 反向要取本模块的共享底层（含测试替身 monkeypatch
+    的 SiteSession），顶层互不 import 才能保证任何导入顺序都不循环。
     """
-    from .cli_pick import _cmd_pick, _cmd_results, _cmd_run
+    from .cli_pick import _cmd_pick, _cmd_record, _cmd_results, _cmd_run
 
     parser = argparse.ArgumentParser(
         prog="pageplay",
@@ -400,18 +429,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--name", default=None, help="recipe 名（默认 <站点>-<序号>）")
     p_pick.set_defaults(func=_cmd_pick)
 
-    p_run = sub.add_parser("run", help="重放 recipe：抓表或下载（默认附着有头活窗）")
-    p_run.add_argument("name", help="recipe 名（pageplay recipes 可查）")
+    p_record = sub.add_parser("record", help="录制一段浏览操作，存为可整链重放的流程")
+    p_record.add_argument("site", help="站点名或网址/域名（如 www.taobao.com）")
+    p_record.add_argument("--name", default=None,
+                          help="流程名（默认交互确认，回车即 <站点>-flow-N）")
+    p_record.set_defaults(func=_cmd_record)
+
+    p_run = sub.add_parser("run",
+                           help="按名字重放：先查流程（整链），再查 recipe（单条）")
+    p_run.add_argument("name", help="流程名（pageplay flows 可查）或 recipe 名（pageplay recipes 可查）")
     p_run.add_argument("--headless", action="store_true",
                        help="用无头守护跑（定时任务场景；无头时无法人工协助风控）")
     p_run.add_argument("--out", default=None,
-                       help="产物目录（默认 ~/Downloads/pageplay/<recipe名>）")
+                       help="产物目录（默认 ~/Downloads/pageplay/<名字>）")
     p_run.set_defaults(func=_cmd_run)
 
     p_recipes = sub.add_parser("recipes", help="列出已保存的 recipe")
     p_recipes.add_argument("site", nargs="?", default=None,
                            help="只列该站点（缺省列全部站点）")
     p_recipes.set_defaults(func=_cmd_recipes)
+
+    p_flows = sub.add_parser("flows", help="列出已录制的流程")
+    p_flows.add_argument("site", nargs="?", default=None,
+                         help="只列该站点（缺省列全部站点）")
+    p_flows.set_defaults(func=_cmd_flows)
 
     p_results = sub.add_parser("results", help="回看历史执行记录（✓✗ 与产物路径）")
     p_results.add_argument("recipe", nargs="?", default=None,

@@ -223,12 +223,13 @@ def test_run_selector_timeout_prompts_repick(home_dir, table_site, monkeypatch,
 
 
 def test_run_unknown_recipe_lists_existing(home_dir, capsys):
-    """recipe 名跨站都找不到：报错列出现有全部 recipe 名；没执行不落账。"""
+    """名字双查都落空：人话列出现有流程与 recipe；没执行不落账。"""
     seed_recipe(home_dir, "faketest-table", "https://x.example.com/table",
                 "table", "#data")
 
     assert main(["run", "no-such"]) == 1
 
     err = capsys.readouterr().err
-    assert "不存在" in err and "faketest-table" in err
+    assert "既不是已保存的流程" in err and "faketest-table" in err
+    assert "现有流程" in err and "现有 recipe" in err
     assert not (home_dir / "runs.jsonl").exists()  # 没执行就没有执行记录

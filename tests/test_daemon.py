@@ -281,10 +281,25 @@ def test_run_login_bounce_recovers_after_human_passes(
     _seed_collab_site(daemon, collab_site)  # recipe/首页都在中性主机
     out_dir = tmp_path / "collab-out"
     monkeypatch.setattr("pageplay.session.time.sleep", lambda _s: None)
-    try:
-        session.ensure_browser(headless=False)  # 有头守护（无显示环境如实跳过）
-    except Exception as exc:
-        pytest.skip(f"无法起有头守护：{exc}")
+    # 系统代理变量（http_proxy/ALL_PROXY 等）会劫持 connect_over_cdp 的
+    # 本机回环请求：_cdp_alive 走 _OPENER 直连拿到 200，playwright driver
+    # 却遵循代理变量经代理转发 → 503（2026-09-24 实测，含/不含代理变量
+    # 对照 1 skipped+泄漏 vs 11 passed）。且该异常发生在 chromium 已起、
+    # session.json 未写之间，会漏守护进程放大并发下的资源争抢。本测试在
+    # 起 driver 前摘掉代理变量，CDP 往返即与生产无代理路径一致。
+    for _var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                 "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(_var, False)  # raise 是关键字，只能按位置传
+    browser = None
+    last: Exception | None = None
+    for _attempt in range(3):  # 守护冷启动/连接瞬时抖动：放宽重试，全败才跳过
+        try:
+            browser = session.ensure_browser(headless=False)  # 有头（无显示如实跳过）
+            break
+        except Exception as exc:
+            last, browser = exc, None
+    if browser is None:
+        pytest.skip(f"无法起有头守护：{last}")
 
     assert main(["run", "collab-1", "--out", str(out_dir)]) == 0
 

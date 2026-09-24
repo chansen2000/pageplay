@@ -1,4 +1,5 @@
-"""pick / run / results 命令处理：确认即执行、风控协作重放、执行回看。
+"""pick / run / record / results 命令处理：确认即执行、流程录制与整链
+重放、风控协作、执行回看。
 
 cli.py 在 _build_parser 内延迟 import 本模块（避免顶层循环依赖），这里
 反向只绑定 cli 模块对象（`from . import cli as _cli`）：共享底层（站点
@@ -8,9 +9,12 @@ session 模块（ensure_browser / ensure_headful_browser / ensure_logged_in）
 
 确认即执行：pick 每确认一条，confirm_and_execute 一次完成「存 recipe →
 当场执行 → 打印 ✓/✗ → 执行账本落账 → 顺手截封面」，单条失败不中断
-框选会话；pick 以 repeat=True 跑会话（T9a/T9c），结束打印摘要。run
-重放遇登录反弹不直接停：进风控协作（ensure_logged_in）等人在窗口里
-完成登录/验证，通过后自动续跑（重试上限 2 次）；results 读账本回看。
+框选会话；pick 以 repeat=True 跑会话（T9a/T9c），结束打印摘要。record
+（T11d）录制整段浏览为流程：收获步当场执行落账但不存单条 recipe，结束
+起名存 flow（flows.py）。run 双查：名字先查流程（runner.run_flow 整链
+重放），未命中再查 recipe（单条重放，原逻辑不变）。重放遇登录反弹不
+直接停：进风控协作（ensure_logged_in）等人在窗口里完成登录/验证，通过
+后自动续跑（重试上限 2 次）；results 读账本回看。
 """
 
 from __future__ import annotations
@@ -25,7 +29,8 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from . import actions, cli as _cli, picker, recipes, runs
+from . import (actions, cli as _cli, flows, picker, recipes, recorder, runs,
+               runner)
 from .guard import RiskTriggered
 from .session import ensure_browser, ensure_headful_browser, ensure_logged_in
 
@@ -106,13 +111,39 @@ def _save_cover(page, result: dict, site_dir: Path, name: str) -> None:
         log.warning("封面截图失败（%s）：%s", name, exc)
 
 
+def _execute_and_record(page, name: str, action: str, selector: str,
+                        columns, out_dir: Path) -> list[Path] | None:
+    """当场执行一次动作并落账（pick 确认执行与 record 收获执行共用）。
+
+    执行 → 打印 ✓（产物绝对路径+大小）或 ✗（人话原因）→ 结果无论成败
+    落账 runs.jsonl。执行失败不向上抛：单条失败不打断框选/录制会话；
+    成功返回产物路径列表，失败返回 None（调用方据此决定是否截封面）。
+    """
+    recipe = {"name": name, "action": action, "selector": selector,
+              "columns": columns}
+    try:
+        rows, products = _execute_recipe(page, recipe, out_dir)
+    except PlaywrightTimeoutError:
+        detail, products = _DOWNLOAD_NO_FILE_HINT, None
+    except Exception as exc:  # 抓表/下载/落盘任何失败：人话 ✗，会话继续
+        detail, products = str(exc), None
+    if products is not None:
+        line = _report_products(action, rows, products)
+        print(f"✓ {line}")
+        _record_run(name, action, "ok", line, products)
+        return products
+    print(f"✗ {detail}", file=sys.stderr)
+    _record_run(name, action, "fail", detail, [])
+    return None
+
+
 def confirm_and_execute(page, site, site_dir: Path, name: str,
                         result: dict) -> None:
     """单条确认的完整闭环（pick 的 on_confirm 钩子本体，可逐条复用）。
 
-    存 recipe → 当场执行一次 → 打印 ✓（产物绝对路径+大小）或 ✗（人话
-    原因）→ 结果无论成败落账 runs.jsonl → 成功再顺手截封面。任何一步
-    失败都不向上抛：单条失败只打 ✗ 并记 fail 账，框选会话继续。
+    存 recipe → 当场执行一次（_execute_and_record：✓/✗ + 落账）→ 成功
+    再顺手截封面。任何一步失败都不向上抛：单条失败只打 ✗ 并记 fail 账，
+    框选会话继续。
     """
     print(f"已锁定 {result['action']}：{result['selector']}")
     try:
@@ -126,20 +157,11 @@ def confirm_and_execute(page, site, site_dir: Path, name: str,
         print(f"✗ {detail}", file=sys.stderr)
         _record_run(name, str(result["action"]), "fail", detail, [])
         return
-    try:
-        rows, products = _execute_recipe(page, recipe, _default_out_dir(name))
-    except PlaywrightTimeoutError:
-        detail, products = _DOWNLOAD_NO_FILE_HINT, None
-    except Exception as exc:  # 抓表/下载/落盘任何失败：人话 ✗，会话继续
-        detail, products = str(exc), None
+    products = _execute_and_record(page, name, recipe["action"],
+                                   recipe["selector"], recipe["columns"],
+                                   _default_out_dir(name))
     if products is not None:
-        line = _report_products(recipe["action"], rows, products)
-        print(f"✓ {line}")
-        _record_run(name, recipe["action"], "ok", line, products)
         _save_cover(page, result, site_dir, name)
-    else:
-        print(f"✗ {detail}", file=sys.stderr)
-        _record_run(name, recipe["action"], "fail", detail, [])
 
 
 # ----------------------------------------------------------------------
@@ -235,21 +257,153 @@ def _cmd_pick(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    """run：重放 recipe（默认附着有头活窗，--headless 走无头守护）。
+def _cmd_record(args: argparse.Namespace) -> int:
+    """record：附着有头活窗录制整段浏览为流程（T11d，设计 §12）。
 
-    被弹回登录页不直接停：进风控协作等人在窗口里完成登录/验证，通过
-    后自动续跑（重试上限 2 次）。其余同 T9b：recipe 名跨站查找，找不到
-    列现有名字；选择器 15s 等不到提示重新 pick；抓表 CSV+JSON 双份、
-    下载存原文件名；结果无论成败落账 runs.jsonl（✓/✗ 人话输出）。
+    自然浏览：点击照常放行、自动记账（recorder.py 契约，cli 不重复造）；
+    按 P 进框选产生收获步（table/download），当场执行并落账——不存单条
+    recipe，流程才是归属。结束（关窗/空闲超时/Ctrl-C）给流程起名
+    （--name 直用；回车默认 <站>-flow-N）落盘 flows/<名字>.json，以后
+    pageplay run <名字> 整链重放。录制期产物放占位目录（流程名结束才
+    定）。一条步骤没收（PickCancelled）→ 已取消，退出码 1。
     """
+    try:
+        _name, pasted_url = _cli.parse_target(args.site)
+        site = _cli._resolve_target(args.site)
+    except (KeyError, ValueError) as exc:
+        print(f"站点解析失败：{exc}", file=sys.stderr)
+        return 1
+    site_dir = _cli._site_dir(site.name)
+    draft_name = f"{site.name}-flow"  # 录制期占位名（流程名结束才定）
+    draft_dir = _default_out_dir(draft_name) / "record"
+
+    browser = ensure_headful_browser()
+    context = browser.contexts[0]
+    page = context.new_page()
+    steps: list[dict] = []
+    start_url = ""
+    try:
+        detail = _goto_with_login_recovery(
+            page, browser, site, pasted_url or site.home_url)
+        if detail is not None:
+            print(f"✗ {detail}", file=sys.stderr)
+            return 1
+        start_url = page.url
+
+        def _on_step(step: dict) -> None:
+            print(f"已记步骤 {step['no']}：{step['kind']} {step['selector']}")
+
+        def _on_harvest(step: dict) -> None:
+            _execute_and_record(page, draft_name, str(step["kind"]),
+                                str(step["selector"]), step.get("columns"),
+                                draft_dir)
+
+        steps = recorder.record_session(page, _on_step, _on_harvest)
+    except picker.PickCancelled as exc:
+        print(f"已取消：{exc}")
+        return 1
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass  # 人关窗收摊时页面已没了
+    if not steps:
+        print("未记录任何操作")
+        return 1
+
+    default_name = flows.next_flow_name(site_dir, site.name)
+    if args.name:
+        flow_name = str(args.name)
+    else:
+        try:
+            flow_name = (input(f"给这次流程起个名（回车 = {default_name} 默认）：")
+                         .strip() or default_name)
+        except EOFError:
+            print("未输入流程名，本次录制未保存（上面已有步骤与产物）",
+                  file=sys.stderr)
+            return 1
+    try:
+        flows.save_flow(site_dir, {"version": 1, "name": flow_name,
+                                   "site": site.name, "url": start_url,
+                                   "steps": steps})
+    except ValueError as exc:
+        print(f"流程保存失败：{exc}", file=sys.stderr)
+        return 1
+    harvested = sum(1 for s in steps if s.get("kind") in ("table", "download"))
+    print(f"流程已保存：{flow_name}")
+    print(f"  共 {len(steps)} 步（收获步 {harvested} 个）｜起始页 {start_url}")
+    print(f"  重放整段：pageplay run {flow_name}")
+    print(f"  录制期产物目录：{draft_dir}")
+    return 0
+
+
+def _snapshot_dir_files(out_dir: Path) -> dict[str, tuple[int, int]]:
+    """产物目录现存文件快照 {路径: (大小, mtime_ns)}；目录不存在 = 空表。"""
+    if not out_dir.is_dir():
+        return {}
+    return {str(p): (p.stat().st_size, p.stat().st_mtime_ns)
+            for p in out_dir.rglob("*") if p.is_file()}
+
+
+def _run_flow_by_name(args: argparse.Namespace, flow_dir: Path) -> int:
+    """流程整链重放：runner.run_flow 逐步执行，一条 run 账 + ✓/✗ 人话。
+
+    产物目录缺省 ~/Downloads/pageplay/<流程名>/（--out 覆盖）；产出清单
+    用"执行前后目录快照对比"得出（runner 只回人话 detail，结构化产物
+    归调用方点数）。登录反弹协作、逐步重试语义全在 runner 内部。
+    """
+    name = str(args.name)
+    flow = flows.load_flow(flow_dir, name)
+    out_dir = (Path(args.out).expanduser() if args.out
+               else _default_out_dir(name))
+    before = _snapshot_dir_files(out_dir)
+    browser = ensure_browser(headless=args.headless)
+    result = runner.run_flow(browser, flow, out_dir, stem=name)
+    outputs = sorted(Path(p) for p, sig in _snapshot_dir_files(out_dir).items()
+                     if before.get(p) != sig)
+    steps_line = "；".join(
+        f"第{r['no']}步[{r['kind']}]{'✓' if r['status'] == 'ok' else '✗'}："
+        f"{r['detail']}" for r in result["results"])
+    if result["ok"]:
+        detail = f"{len(result['results'])} 步全部完成：{steps_line}"
+        print(f"✓ 流程 {name}：{len(result['results'])} 步全部完成")
+        for p in outputs:
+            print(f"  产物 {p.resolve()}（{actions.file_size_str(p)}）")
+        _record_run(name, "flow", "ok", detail, outputs)
+        return 0
+    failed = next((r for r in result["results"] if r["status"] == "fail"),
+                  {"no": result["failed_step"], "detail": "执行中断"})
+    print(f"✗ 流程 {name} 第 {failed['no']} 步：{failed['detail']}",
+          file=sys.stderr)
+    _record_run(name, "flow", "fail", steps_line, outputs)
+    return 1
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """run：重放流程或 recipe（双查：名字先查 flows 整链，再查 recipe）。
+
+    流程命中 → runner.run_flow 整链自动重放（默认附着有头活窗，
+    --headless 走无头守护），整链一条 run 账。recipe 命中 → 原单条重放
+    逻辑原样（T9b 语义零回归）。被弹回登录页都不直接停：进风控协作等人
+    在窗口里完成登录/验证，通过后自动续跑（重试上限 2 次）。两者都找
+    不到 → 人话列出可用流程与 recipe；结果无论成败落账 runs.jsonl。
+    """
+    flow_dir = next((d for d in _cli._flow_site_dirs()
+                     if (d / "flows" / f"{args.name}.json").is_file()), None)
+    if flow_dir is not None:
+        return _run_flow_by_name(args, flow_dir)
     site_dir = next((d for d in _cli._recipe_site_dirs()
                      if (d / "recipes" / f"{args.name}.json").is_file()), None)
     if site_dir is None:
-        names = sorted(str(r["name"]) for d in _cli._recipe_site_dirs()
-                       for r in recipes.list_recipes(d))
-        known = "、".join(names) if names else "（一个都没有）"
-        print(f"recipe {args.name!r} 不存在；现有 recipe：{known}", file=sys.stderr)
+        flow_names = sorted(str(f["name"]) for d in _cli._flow_site_dirs()
+                            for f in flows.list_flows(d))
+        recipe_names = sorted(str(r["name"]) for d in _cli._recipe_site_dirs()
+                              for r in recipes.list_recipes(d))
+        flow_known = "、".join(flow_names) if flow_names else "（一个都没有）"
+        recipe_known = "、".join(recipe_names) if recipe_names else "（一个都没有）"
+        print(f"{args.name!r} 既不是已保存的流程，也不是 recipe；"
+              f"现有流程：{flow_known}；现有 recipe：{recipe_known}",
+              file=sys.stderr)
         return 1
     recipe = recipes.load_recipe(site_dir, args.name)
     try:

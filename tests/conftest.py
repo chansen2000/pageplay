@@ -334,3 +334,88 @@ def collab_site():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# T11b：流程录制假站（recorder 录制层测试用）
+# ---------------------------------------------------------------------------
+
+_FLOW_START_HTML = """<html><body>
+<h1>录制起点</h1>
+<a id="to-list" href="/list">去列表页</a>
+<a id="to-other" href="/other">外部链接</a>
+<table id="t1">
+  <thead><tr><th>A</th><th>B</th><th>C</th></tr></thead>
+  <tbody>
+    <tr><td>a1</td><td>b1</td><td>c1</td></tr>
+    <tr><td>a2</td><td>b2</td><td>c2</td></tr>
+    <tr><td>a3</td><td>b3</td><td>c3</td></tr>
+  </tbody>
+</table>
+</body></html>"""
+
+_FLOW_LIST_HTML = """<html><body>
+<h1>列表页</h1>
+<table id="t2">
+  <thead><tr><th>名称</th><th>价格</th></tr></thead>
+  <tbody>
+    <tr><td>苹果</td><td>5.5</td></tr>
+    <tr><td>香蕉</td><td>3.2</td></tr>
+  </tbody>
+</table>
+<a id="back" href="/start">回起点</a>
+</body></html>"""
+
+_FLOW_OTHER_HTML = """<html><body>
+<h1>外部落点</h1>
+</body></html>"""
+
+
+class _FlowSiteHandler(BaseHTTPRequestHandler):
+    """录制假站：GET /start 起点页（内链 /list + 外链样式 /other +
+    id="t1" 3 行 3 列小表）；GET /list 列表页（id="t2" 两列表 + 回程
+    /start 链接）；GET /other 落点页。能同时演"点击跳转 + P 框选"。
+    """
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/start"):
+            self._send_html(200, _FLOW_START_HTML)
+        elif self.path.startswith("/list"):
+            self._send_html(200, _FLOW_LIST_HTML)
+        elif self.path.startswith("/other"):
+            self._send_html(200, _FLOW_OTHER_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass  # 静默：不把假站访问日志刷进测试输出
+
+
+@pytest.fixture
+def flow_site():
+    """起流程录制假站（端口 0），yield base_url 字符串，测完关停。
+
+    路由：GET /start → 起点页（<a id="to-list" href="/list">、
+    <a id="to-other" href="/other">、id="t1" 3 行 3 列表）；
+    GET /list → 列表页（id="t2" 两列表、<a id="back" href="/start">）；
+    GET /other → 落点页。风格与 fake_site / nav_site 一致。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FlowSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
