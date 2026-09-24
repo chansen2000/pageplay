@@ -72,9 +72,9 @@ def _load_saved_preset(name: str) -> SitePreset | None:
         login_url = str(meta["login_url"])
     except (OSError, ValueError, KeyError, TypeError):
         raise KeyError(
-            f"站点 {name!r} 的 meta.json 损坏或缺少 login_url；"
-            f"请删除该站点目录后重新 pageplay login {name} --url <登录页URL>"
+            f"站点 {name!r} 的 meta.json 损坏或缺少 login_url；请删除该站点目录后重新 pageplay login {name} --url <登录页URL>"
         ) from None
+
     hostname = urlsplit(login_url).hostname or ""
     if "." not in hostname:
         raise KeyError(
@@ -109,8 +109,7 @@ def _resolve_target(arg: str) -> SitePreset:
         saved_names = _saved_site_names()
         builtin_names = ", ".join(sorted(s.name for s in list_builtin()))
         raise KeyError(
-            f"站点 {name!r} 还没有登录记录；"
-            f"先运行 pageplay login {arg.strip()}。"
+            f"站点 {name!r} 还没有登录记录；先运行 pageplay login {arg.strip()}。"
             f"已存站点：{', '.join(saved_names) if saved_names else '无'}；"
             f"内置：{builtin_names}"
         ) from None
@@ -192,9 +191,8 @@ def _cmd_login(args: argparse.Namespace) -> int:
               f"（滑块/扫码自行通过），最长等待 {args.timeout} 秒…")
         if not session.login(timeout_sec=args.timeout,
                              url=effective_url if hit_builtin else None):
-            hint = f"pageplay login {site.name}"
-            if args.url:
-                hint += f" --url {args.url}"
+            hint = f"pageplay login {site.name}" + (
+                f" --url {args.url}" if args.url else "")
             print(f"{site.name}：超时未检测到登录态。浏览器窗口保持打开，"
                   f"可重跑 {hint} 再试一次。", file=sys.stderr)
             return 1
@@ -222,6 +220,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             rows[meta_path.parent.name] = _snapshot_time(meta_path.parent)
     for preset in list_builtin():  # 内置站点未保存也列出，标"未登录"
         rows.setdefault(preset.name, "未登录")
+    if args.json:  # 机读出口：JSON 数组（GUI 下拉数据源），空库也是 []
+        print(json.dumps([{"name": n, "saved_at": t}
+                          for n, t in sorted(rows.items())],
+                         ensure_ascii=False))
+        return 0
     if not rows:
         print("暂无站点。用 pageplay login <站点名> 登录第一个站点。")
         return 0
@@ -343,6 +346,9 @@ def _cmd_recipes(args: argparse.Namespace) -> int:
     else:
         site_dirs = _recipe_site_dirs()
     rows = [(d, r) for d in site_dirs for r in recipes.list_recipes(d)]
+    if args.json:  # 机读出口：list_recipes 原始 dict 数组，空库也是 []
+        print(json.dumps([r for _d, r in rows], ensure_ascii=False))
+        return 0
     if not rows:
         print("暂无 recipe。用 pageplay pick <站点或网址> 框选第一个诉求。")
         return 0
@@ -364,6 +370,9 @@ def _cmd_flows(args: argparse.Namespace) -> int:
     else:
         site_dirs = _flow_site_dirs()
     rows = [(d, f) for d in site_dirs for f in flows.list_flows(d)]
+    if args.json:  # 机读出口：list_flows 原始 dict 数组，空库也是 []
+        print(json.dumps([f for _d, f in rows], ensure_ascii=False))
+        return 0
     if not rows:
         print("暂无流程。用 pageplay record <站点或网址> 录制第一个流程。")
         return 0
@@ -397,13 +406,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_login = sub.add_parser("login", help="人工登录并保存会话快照")
     p_login.add_argument(
         "site",
-        help="站点名（如 taobao）或网址/域名（如 www.taobao.com，"
-             "命中预设自动识别，陌生站登录后按回车保存）")
+        help="站点名（如 taobao）或网址/域名（如 www.taobao.com，命中预设自动识别，陌生站登录后按回车保存）")
     p_login.add_argument("--url", default=None, help="自定义登录页 URL（不走内置预设）")
     p_login.add_argument("--timeout", type=int, default=300, help="等待人工登录的超时秒数")
     p_login.set_defaults(func=_cmd_login)
 
     p_list = sub.add_parser("list", help="列出已保存站点与内置预设")
+    p_list.add_argument("--json", action="store_true",
+                        help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_list.set_defaults(func=_cmd_list)
 
     p_doctor = sub.add_parser("doctor", help="检查登录态是否仍有效")
@@ -447,11 +457,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_recipes = sub.add_parser("recipes", help="列出已保存的 recipe")
     p_recipes.add_argument("site", nargs="?", default=None,
                            help="只列该站点（缺省列全部站点）")
+    p_recipes.add_argument("--json", action="store_true",
+                           help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_recipes.set_defaults(func=_cmd_recipes)
 
     p_flows = sub.add_parser("flows", help="列出已录制的流程")
     p_flows.add_argument("site", nargs="?", default=None,
                          help="只列该站点（缺省列全部站点）")
+    p_flows.add_argument("--json", action="store_true",
+                         help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_flows.set_defaults(func=_cmd_flows)
 
     p_results = sub.add_parser("results", help="回看历史执行记录（✓✗ 与产物路径）")
@@ -459,6 +473,8 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="只看该 recipe 的记录（缺省看全部）")
     p_results.add_argument("--limit", type=int, default=20,
                            help="最多显示条数（默认 20）")
+    p_results.add_argument("--json", action="store_true",
+                           help="stdout 打机读 JSON 数组（GUI 数据源）")
     p_results.set_defaults(func=_cmd_results)
 
     p_shutdown = sub.add_parser("shutdown", help="关闭常驻浏览器守护")

@@ -112,6 +112,23 @@ pageplay results daily-orders --limit 5
 pageplay shutdown                 # 关闭常驻浏览器守护（定时场景收尾）
 ```
 
+四个清单命令（list/flows/recipes/results）都支持 `--json`：stdout 打机读
+JSON 数组（ensure_ascii=False，空库输出 `[]`），文本输出照旧不变。
+
+## GUI：pageplay-gui（Tkinter 控制台）
+
+```bash
+pageplay-gui                      # 或 python -m pageplay.gui
+```
+
+GUI 只是壳：每个按钮背后执行的就是同一套 pageplay 命令行（不改引擎行为），
+子进程输出逐行回显到底部日志窗。布局三段——顶部站点/网址输入框、流程/recipe
+下拉（「刷新」或每次命令结束自动刷新）、名称输入框（录制 `--name`）与无头
+重放勾选；中部十个按钮（登录｜验活｜打开窗口｜录制｜重放｜导出｜结果｜
+流程列表｜recipe列表｜关闭守护）；底部时间戳日志窗。运行期互斥（其余按钮
+禁用），「取消」等同 Ctrl-C；关窗时若命令仍在跑会先终止它。环境变量
+`PAGEPLAY_HOME` 原样透传给子进程。
+
 ## 存储位置与 PAGEPLAY_HOME
 
 ```

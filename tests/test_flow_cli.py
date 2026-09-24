@@ -14,7 +14,8 @@ from pageplay.cli_pick import _runs_path
 from pageplay.flows import load_flow, save_flow
 from pageplay.guard import RiskTriggered
 from pageplay.picker import PickCancelled
-from pageplay.runs import load_runs
+from pageplay.recipes import save_recipe
+from pageplay.runs import load_runs, record_run
 
 from fakes_browser import (
     PickPage,
@@ -275,3 +276,63 @@ def test_flows_empty_gives_record_hint(home_dir, capsys):
     assert main(["flows"]) == 0
     out = capsys.readouterr().out
     assert "暂无流程" in out and "pageplay record" in out
+
+
+# ----------------------------------------------------------------------
+# --json：机读输出（T12 GUI 下拉数据源）
+# ----------------------------------------------------------------------
+
+def test_json_outputs_parse_with_expected_fields(home_dir, capsys):
+    """四个清单命令 --json：stdout 是 JSON 数组，字段与文本版对齐。"""
+    _seed_flow(home_dir, "j-flow")
+    save_recipe(home_dir / "sites" / "faketest", {
+        "version": 1, "name": "j-recipe", "site": "faketest", "url": _START,
+        "action": "table", "selector": "#t1"})
+    record_run(_runs_path(), {"recipe": "j-recipe", "action": "table",
+                              "status": "ok", "detail": "已生成", "outputs": []})
+
+    assert main(["list", "--json"]) == 0
+    sites = json.loads(capsys.readouterr().out)
+    assert isinstance(sites, list) and sites
+    assert {"name", "saved_at"} <= set(sites[0])
+    assert any(s["name"] == "faketest" for s in sites)
+
+    assert main(["flows", "--json"]) == 0
+    (flow,) = json.loads(capsys.readouterr().out)
+    assert flow["name"] == "j-flow" and flow["step_count"] == 2
+    assert {"name", "url", "step_count", "created_at"} == set(flow)
+
+    assert main(["recipes", "--json"]) == 0
+    (recipe,) = json.loads(capsys.readouterr().out)
+    assert recipe["name"] == "j-recipe" and recipe["action"] == "table"
+    assert {"name", "action", "url", "created_at"} == set(recipe)
+
+    assert main(["results", "--json"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)
+    assert entry["recipe"] == "j-recipe" and entry["status"] == "ok"
+    assert {"recipe", "action", "status", "detail", "outputs",
+            "created_at"} == set(entry)
+
+
+def test_json_empty_outputs_empty_array(home_dir, capsys):
+    """空库 --json：flows/results 输出 []（GUI 空态数据源）。"""
+    assert main(["flows", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert main(["results", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_json_keeps_non_ascii_and_text_path_unchanged(home_dir, capsys):
+    """--json 不转义中文（ensure_ascii=False）；不带 --json 文本输出照旧。"""
+    save_flow(home_dir / "sites" / "faketest", {
+        "version": 1, "name": "中文流程", "site": "faketest", "url": _START,
+        "steps": [{"no": 1, "kind": "goto", "url": _START}]})
+
+    assert main(["flows", "--json"]) == 0
+    raw = capsys.readouterr().out
+    assert "中文流程" in raw and "\\u4e2d" not in raw  # 不转义，直接可读
+    assert json.loads(raw)[0]["name"] == "中文流程"
+
+    assert main(["flows"]) == 0  # 人类文本路径零回归
+    out = capsys.readouterr().out
+    assert "中文流程" in out and "已保存流程" in out

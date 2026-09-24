@@ -1,0 +1,301 @@
+"""Tkinter 控制台：GUI 只是壳，实际执行同一套 pageplay CLI（sheng 拍板）。
+
+本文件不实现任何引擎逻辑：每个按钮经 build_command 拼出 argv，子进程跑
+与终端完全相同的 pageplay 命令（cli.main），输出逐行回读进日志窗。不改
+引擎行为；PAGEPLAY_HOME 等环境变量原样透传给子进程（Popen 继承 os.environ，
+仅追加 PYTHONUNBUFFERED 让日志行实时到达，不做任何特殊处理）。
+
+线程模型（tkinter 唯一安全做法）：子进程在后台 daemon 线程逐行读
+stdout → queue.Queue → 主线程 after(100ms) 轮询刷 UI；tkinter 控件只在
+主线程碰。运行期互斥：全部按钮 disabled + 状态栏"执行中…"；结束恢复并
+自动刷新下拉（flows/recipes --json 机读数组）。「取消」= terminate（等同
+Ctrl-C）；退出 GUI 时若子进程仍在跑，先 terminate 再关窗。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import scrolledtext, ttk
+
+# 子进程命令前缀：同一解释器、同一 CLI 入口（cli.main），退出码原样透传。
+# 用 -c 而不是 -m，因为 cli.py 没有也不需要 __main__ 块。
+_CLI_PREFIX = [sys.executable, "-c",
+               "import sys; from pageplay.cli import main; sys.exit(main())"]
+
+# 仓库根：未安装（python -m pageplay.gui 直接从源码跑）时保证子进程
+# 能 import 到本包；已安装场景下 cwd 在此也不影响行为。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# record 等命令要交互的路径都已有 EOFError 兜底；GUI 传 --name 走非交互
+_REQUIRES_SITE = frozenset({"login", "doctor", "open", "record", "export"})
+_OPERATIONS = frozenset({
+    "login", "doctor", "open", "record", "run", "export",
+    "results", "flows", "recipes", "shutdown",
+})
+
+
+def build_command(op: str, params: dict | None = None) -> list[str]:
+    """把 GUI 操作翻译成完整 pageplay argv（纯函数，单测锚点）。
+
+    op ∈ {login, doctor, open, record, run, export, results, flows,
+    recipes, shutdown}；params 只认三个键：site_or_url（顶部站点/网址
+    输入框）、name（名称输入框，record 时作 --name；run 时作重放名）、
+    headless（run 时作 --headless）。多余的键忽略。
+    - login/doctor/open/record/export 必填 site_or_url，缺 → ValueError
+    - run 必填 name（下拉选中的流程/recipe 名），缺 → ValueError
+    - record 有 name 才传 --name（不传走 CLI 默认命名）
+    - run 有 headless 才传 --headless
+    非法 op → ValueError。
+    """
+    if op not in _OPERATIONS:
+        raise ValueError(
+            f"未知操作：{op!r}（可用：{', '.join(sorted(_OPERATIONS))}）")
+    params = dict(params or {})
+    site = str(params.get("site_or_url") or "").strip()
+    name = str(params.get("name") or "").strip()
+    if op in _REQUIRES_SITE and not site:
+        raise ValueError(f"{op} 需要站点或网址：请先在顶部填写")
+    if op == "run" and not name:
+        raise ValueError("重放需要流程或 recipe 名：请先在下拉框选择（或点「刷新」）")
+    argv = [op]
+    if op in _REQUIRES_SITE:
+        argv.append(site)
+    if op == "run":
+        argv.append(name)
+        if params.get("headless"):
+            argv.append("--headless")
+    elif op == "record" and name:
+        argv += ["--name", name]
+    return argv
+
+
+class App:
+    """主窗口：顶（输入+下拉）／中（按钮网格）／底（日志窗）三段布局。
+
+    运行模型：_launch 起子进程与读线程 → _pump 逐行入队 → _poll 在主线程
+    消费队列刷日志/状态。队列元素：str = 一行日志；tuple = 控制消息
+    ("done", 退出码) 或 ("names", 来源, 名单)。
+    """
+
+    POLL_MS = 100
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.queue: queue.Queue = queue.Queue()
+        self.proc: subprocess.Popen | None = None
+        self.cancelled = False
+        self._buttons: dict[str, ttk.Button] = {}
+        self._names: dict[str, list[str]] = {}  # {"flows": […], "recipes": […]}
+        self._build_ui()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.after(self.POLL_MS, self._poll)
+        self.refresh_names()
+
+    # ------------------------------------------------------------------
+    # 布局（三段）
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="站点/网址").pack(side="left")
+        self.site_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.site_var, width=22).pack(
+            side="left", padx=(4, 12))
+        ttk.Label(top, text="名称").pack(side="left")
+        self.name_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.name_var, width=14).pack(
+            side="left", padx=(4, 12))
+        ttk.Label(top, text="流程/recipe").pack(side="left")
+        self.pick_var = tk.StringVar()
+        self.pick_box = ttk.Combobox(top, textvariable=self.pick_var,
+                                     width=20, values=[])
+        self.pick_box.pack(side="left", padx=(4, 8))
+        self._buttons["刷新"] = ttk.Button(top, text="刷新",
+                                           command=self.refresh_names)
+        self._buttons["刷新"].pack(side="left")
+        self.headless_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="无头重放",
+                        variable=self.headless_var).pack(side="left",
+                                                         padx=(12, 0))
+
+        grid = ttk.Frame(self.root)
+        grid.pack(fill="x", padx=8, pady=4)
+        actions = [("登录", "login"), ("验活", "doctor"),
+                   ("打开窗口", "open"), ("录制", "record"), ("重放", "run"),
+                   ("导出", "export"), ("结果", "results"),
+                   ("流程列表", "flows"), ("recipe列表", "recipes"),
+                   ("关闭守护", "shutdown")]
+        for i, (label, op) in enumerate(actions):
+            btn = ttk.Button(grid, text=label,
+                             command=lambda op=op: self._launch(op))
+            btn.grid(row=i // 5, column=i % 5, sticky="ew", padx=3, pady=2)
+            grid.columnconfigure(i % 5, weight=1)
+            self._buttons[label] = btn
+
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", padx=8)
+        self.status_var = tk.StringVar(value="空闲")
+        ttk.Label(bar, textvariable=self.status_var,
+                  anchor="w").pack(side="left", fill="x", expand=True)
+        self.cancel_btn = ttk.Button(bar, text="取消", command=self._cancel,
+                                     state="disabled")
+        self.cancel_btn.pack(side="right")
+
+        self.log = scrolledtext.ScrolledText(self.root, height=18,
+                                             state="disabled", wrap="word")
+        self.log.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+    # ------------------------------------------------------------------
+    # 运行模型：起子进程 → 后台读 → 主线程刷
+    # ------------------------------------------------------------------
+
+    def _launch(self, op: str) -> None:
+        """按钮统一入口：拼 argv → 起子进程 → 进入互斥运行态。"""
+        params = {"site_or_url": self.site_var.get(),
+                  "name": self.name_var.get(),
+                  "headless": bool(self.headless_var.get())}
+        if op == "run":  # 重放：下拉选中值即名字（先流程后 recipe 由 CLI 双查）
+            params["name"] = self.pick_var.get()
+        try:
+            argv = build_command(op, params)
+        except ValueError as exc:
+            self._log(f"未执行：{exc}")
+            return
+        self._log(f"$ pageplay {' '.join(argv)}")
+        env = dict(os.environ)  # PAGEPLAY_HOME 等原样透传
+        env["PYTHONUNBUFFERED"] = "1"  # 子进程 print 即时到达日志窗
+        try:
+            self.proc = subprocess.Popen(
+                _CLI_PREFIX + argv, cwd=_REPO_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", env=env)
+        except OSError as exc:
+            self.proc = None
+            self._log(f"启动失败：{exc}")
+            return
+        self.cancelled = False
+        self._set_running(True)
+        threading.Thread(target=self._pump, args=(self.proc,),
+                         daemon=True).start()
+
+    def _pump(self, proc: subprocess.Popen) -> None:
+        """后台线程：逐行读子进程 stdout 入队；结束后投递 ("done", 码)。
+
+        线程里只碰 queue，不碰任何 tkinter 控件。
+        """
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self.queue.put(line.rstrip("\n"))
+        self.queue.put(("done", proc.wait()))
+
+    def _poll(self) -> None:
+        """主线程消费队列：日志行刷窗，控制消息改状态/下拉。"""
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                if isinstance(item, str):
+                    self._log(item)
+                elif item[0] == "done":
+                    self._on_done(int(item[1]))
+                elif item[0] == "names":
+                    self._on_names(str(item[1]), list(item[2]))
+        except queue.Empty:
+            pass
+        self.root.after(self.POLL_MS, self._poll)
+
+    def _on_done(self, code: int) -> None:
+        self._set_running(False)
+        self.proc = None
+        if self.cancelled:
+            self._log("— 已被用户取消 —")
+            self.status_var.set("已取消")
+        else:
+            self._log(f"— 退出码 {code} —")
+            self.status_var.set(f"空闲（上次退出码 {code}）")
+        self.refresh_names()  # 结束自动刷新下拉（--json 机读）
+
+    def _cancel(self) -> None:
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        self.cancelled = True
+        try:
+            proc.terminate()  # 等同 Ctrl-C
+        except ProcessLookupError:
+            pass  # 恰好已自己退出，done 消息稍后照常到达
+        self._log("已发送终止信号（等同 Ctrl-C）…")
+
+    def _set_running(self, running: bool) -> None:
+        """互斥：运行中全部按钮 disabled（取消钮除外），状态栏提示。"""
+        for btn in self._buttons.values():
+            btn.state(["disabled"] if running else ["!disabled"])
+        self.cancel_btn.state(["!disabled"] if running else ["disabled"])
+        if running:
+            self.status_var.set("执行中…")
+
+    # ------------------------------------------------------------------
+    # 日志窗与下拉刷新
+    # ------------------------------------------------------------------
+
+    def _log(self, line: str) -> None:
+        """追加一行（时间戳前缀）并滚动跟底；日志窗常态只读。"""
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{stamp}] {line}\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def refresh_names(self) -> None:
+        """后台拉 flows/recipes --json 回填下拉；失败静默保持旧值。"""
+        for op in ("flows", "recipes"):
+            threading.Thread(target=self._fetch_names, args=(op,),
+                             daemon=True).start()
+
+    def _fetch_names(self, op: str) -> None:
+        """后台线程：跑一条清单命令的 --json，解析出名字列表入队。"""
+        try:
+            cmd = _CLI_PREFIX + build_command(op) + ["--json"]
+            done = subprocess.run(cmd, cwd=_REPO_ROOT, capture_output=True,
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=60)
+            names = [str(row["name"]) for row in json.loads(done.stdout)]
+        except (OSError, ValueError, KeyError, TypeError):
+            return  # 静默：下拉保持旧值，不因刷新失败打扰
+        self.queue.put(("names", op, names))
+
+    def _on_names(self, op: str, names: list[str]) -> None:
+        self._names[op] = names
+        # flows 与 recipes 合并展示：run 双查两种名字都能重放
+        merged = sorted(set(self._names.get("flows", []))
+                        | set(self._names.get("recipes", [])))
+        self.pick_box["values"] = merged
+
+    def _on_close(self) -> None:
+        """退出 GUI：子进程还在跑就先 terminate（等同 Ctrl-C）再关窗。"""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        self.root.destroy()
+
+
+def main() -> None:
+    """GUI 入口：只有这里才建 Tk root 起主循环（import 本模块零副作用）。"""
+    root = tk.Tk()
+    root.title("pageplay 控制台")
+    root.geometry("780x520")
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

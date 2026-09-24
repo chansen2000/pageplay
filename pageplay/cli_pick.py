@@ -20,6 +20,7 @@ session 模块（ensure_browser / ensure_headful_browser / ensure_logged_in）
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -456,6 +457,9 @@ def _cmd_results(args: argparse.Namespace) -> int:
     只读视图，永远退出码 0。
     """
     entries = runs.load_runs(_runs_path(), recipe=args.recipe, limit=args.limit)
+    if args.json:  # 机读出口：账本 entry 原样数组，空账也是 []（GUI 数据源）
+        print(json.dumps(entries, ensure_ascii=False))
+        return 0
     if not entries:
         target = f"recipe {args.recipe!r} " if args.recipe else ""
         print(f"{target}暂无执行记录。pick 确认或 pageplay run 执行后可在这里回看。")
