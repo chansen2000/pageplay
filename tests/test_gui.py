@@ -2,19 +2,22 @@
 
 tkinter UI 本身不自动化测试（人验收）；这里只测纯函数：build_command
 （op → argv 翻译与参数校验）、load_csv_for_preview / latest_csv_output
-（v0.7-B 数据预览的数据层）、should_preview / _count_runs（v0.7 收口的
-预览触发闸门），并保证 import pageplay.gui 零副作用——不建 Tk root、
-不起主循环（main() 才起）。
+（v0.7-B 数据预览的数据层，T18 起实现在 pageplay.gui_preview、gui.py
+回导旧名）、should_preview / _count_runs（v0.7 收口的预览触发闸门），
+并保证 import pageplay.gui 零副作用——不建 Tk root、不起主循环
+（main() 才起）。T18 追加向导式布局的源码静态断言（防回退成平铺）。
 """
 
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
 import pageplay.gui
+import pageplay.gui_preview
 from pageplay.gui import (build_command, latest_csv_output,
                           load_csv_for_preview, next_record_name,
                           should_preview)
@@ -257,3 +260,27 @@ def test_count_runs_counts_nonblank_lines(tmp_path):
     p.write_text(_run_line() + "\n" + _run_line(status="fail") + "\n\n",
                  encoding="utf-8")
     assert pageplay.gui._count_runs(p) == 2
+
+
+# ----------------------------------------------------------------------
+# T18 向导式布局：源码静态断言（防回退成平铺）+ 预览拆分回导
+# ----------------------------------------------------------------------
+
+def test_gui_source_keeps_wizard_layout_markers():
+    """gui.py 源码含向导四段标记与序号按钮：布局重构的防回退锚点。"""
+    source = Path(pageplay.gui.__file__).read_text(encoding="utf-8")
+    for marker in ("第 1 步", "第 2 步", "第 3 步", "管理（低频）",
+                   "① 登录", "② 录制", "③ 取当前页", "④ 重放",
+                   "2A 临时抓一页", "2B 反复自动抓"):
+        assert marker in source, f"GUI 源码缺少向导布局标记：{marker!r}"
+
+
+def test_preview_code_lives_in_gui_preview_and_reexported():
+    """预览实现整体在 gui_preview（T18 拆分）；gui 回导同一对象，
+    `pageplay.gui.latest_csv_output` 等旧 import 路径不破。"""
+    for name in ("latest_csv_output", "load_csv_for_preview",
+                 "should_preview", "_count_runs"):
+        func = getattr(pageplay.gui_preview, name)
+        assert callable(func), f"gui_preview 缺少 {name}"
+        assert getattr(pageplay.gui, name) is func  # 同一对象 = 回导非拷贝
+    assert callable(pageplay.gui_preview.open_preview_window)

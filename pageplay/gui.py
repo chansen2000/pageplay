@@ -7,9 +7,10 @@
 queue，主线程 after(100ms) 轮询刷 UI，控件只在主线程碰；运行期互斥按钮
 全 disabled，结束恢复并自动刷新下拉（--json 机读数组）。「取消」= SIGINT
 安全收尾（T13 契约，详见 _cancel / _on_close）。「录制」名称留空自动起
-默认名并回填输入框（T13.3 防丢）。v0.7-B 起命令正常结束扫执行账本弹
-CSV 只读预览窗；v0.7 收紧为只在账本新增记录时弹（_launch 记行数基线 →
-_on_done 比对 should_preview），doctor 等无收获命令不再反复弹旧 CSV。
+默认名并回填输入框（T13.3 防丢）。数据预览（v0.7-B）整体在
+gui_preview.py，本模块回导其全部旧名；预览触发 = 账本新增记录才弹
+（_launch 记行数基线 → _on_done 比对 should_preview）。T18 起布局改
+向导式四段（sheng 拍板"按使用顺序组织界面"），按钮与 op 映射不变。
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 
-from .actions import file_size_str
+from .gui_preview import (_count_runs, _runs_jsonl_path, latest_csv_output,
+                          load_csv_for_preview, open_preview_window,
+                          should_preview)  # 既有 pageplay.gui.* 名字照旧可用
 
 # 子进程命令前缀：同一解释器、同一 CLI 入口（cli.main），退出码原样透传。
 # 用 -c 而不是 -m，因为 cli.py 没有也不需要 __main__ 块。
@@ -112,92 +115,14 @@ def next_record_name(site: str, known_flows) -> str:
     return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')[-4:]}"
 
 
-def _runs_jsonl_path() -> Path:
-    """执行账本路径（GUI 只读不写）：与 cli_pick 同款，PAGEPLAY_HOME 覆盖。"""
-    return Path(os.environ.get("PAGEPLAY_HOME", "~/.pageplay")
-                ).expanduser() / "runs.jsonl"
-
-
-def latest_csv_output(runs_path: Path) -> str | None:
-    """账本最后一条有效记录的 .csv 产物路径；没有 → None。
-
-    从文件末尾向前找第一条能解析的记录（坏行——JSON 损坏/非对象——
-    跳过继续向前）；status=ok 且 outputs 里有 .csv（取最后一个）→
-    返回该路径，否则 None（fail / ok 无 csv / 不存在 / 空文件）。
-    只认最后一条有效记录，不回看更旧的收获。
-    """
-    runs_path = Path(runs_path)
-    if not runs_path.is_file():
-        return None
-    text = runs_path.read_text(encoding="utf-8", errors="replace")
-    lines = text.splitlines()
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-        except ValueError:
-            continue  # 坏行跳过
-        if not isinstance(data, dict):
-            continue
-        outputs = data.get("outputs")
-        if data.get("status") == "ok" and isinstance(outputs, list):
-            for item in reversed(outputs):
-                if str(item).lower().endswith(".csv"):
-                    return str(item)
-        return None  # 最后一条有效记录说了算
-    return None
-
-
-def _count_runs(runs_path: Path) -> int:
-    """账本非空行数（读不了 → 0）；追加式账本：行数增长 = 新增了执行记录。"""
-    try:
-        text = Path(runs_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return 0
-    return sum(1 for ln in text.splitlines() if ln.strip())
-
-
-def should_preview(before: int, after: int) -> bool:
-    """预览闸门（纯函数）：账本行数有增长才值得弹预览（无增长 = 无新收获）。"""
-    return after > before
-
-
-def load_csv_for_preview(path: str, max_rows: int = 500
-                         ) -> tuple[list[str], list[list[str]]]:
-    """CSV → (表头, 行) 预览数据，值全文本，最多 max_rows 行。
-
-    pandas.read_csv(dtype=str, keep_default_na=False)：编号列保持文本
-    （"001" 不变形），空单元格是 ""；utf-8-sig 兼容 save_table 带 BOM
-    产物。不存在/空文件/解析失败 → ValueError（人话）。超 max_rows 只
-    返回前 max_rows 行；判"是否截断"用 max_rows+1 再读一次看是否多
-    返回一行（GUI 用此法打标记，不猜）。
-    """
-    csv_path = Path(path)
-    if not csv_path.is_file():
-        raise ValueError(f"找不到 CSV 文件：{csv_path}")
-    try:
-        import pandas  # 延迟导入：预览用到才加载，GUI 启动不背其开销
-    except ImportError as exc:
-        raise ValueError(f"预览需要 pandas（当前环境未安装）：{exc}") from exc
-    try:
-        df = pandas.read_csv(csv_path, dtype=str, keep_default_na=False,
-                             encoding="utf-8-sig", nrows=max(max_rows, 0))
-    except pandas.errors.EmptyDataError as exc:
-        raise ValueError(f"CSV 文件是空的：{csv_path}") from exc
-    except OSError as exc:
-        raise ValueError(f"读不了 CSV 文件：{csv_path}（{exc}）") from exc
-    except ValueError as exc:  # 解析失败（ParserError 是 ValueError 子类）
-        raise ValueError(f"不是有效的 CSV：{csv_path}（{exc}）") from exc
-    columns = [str(c) for c in df.columns]
-    rows = [[str(v) for v in row]
-            for row in df.itertuples(index=False, name=None)]
-    return columns, rows
-
-
 class App:
-    """主窗口：顶（输入+下拉）／中（按钮网格）／底（日志窗）三段布局。
+    """主窗口：向导式四段布局（T18，sheng 拍板"按使用顺序组织界面"）。
+
+    自上而下 = 一次完整使用的先后顺序：第 1 步登录网站（每站一次）→
+    第 2 步抓数据（2A 临时抓一页 / 2B 录制反复抓，两条路选一条）→
+    第 3 步看结果 → 管理（低频）；底部状态栏 + 日志窗照旧。每段一个
+    LabelFrame；按钮文字带序号（① 登录 / ② 录制 / ③ 取当前页 /
+    ④ 重放），按钮 → op 映射与 build_command 一字未动，只重新摆放。
 
     运行模型：_launch 起子进程与读线程 → _pump 逐行入队 → _poll 主线程
     消费刷日志/状态。队列元素：str = 日志行；tuple = ("done", 码)
@@ -220,44 +145,73 @@ class App:
         root.after(self.POLL_MS, self._poll)
         self.refresh_names()
 
-    # ---- 布局（三段）--------------------------------------------------
+    # ---- 布局（向导四段）----------------------------------------------
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Label(top, text="站点/网址").pack(side="left")
+        body = ttk.Frame(self.root)
+        body.pack(fill="x", padx=8, pady=(8, 4))
+
+        def add_button(parent: ttk.Frame, label: str, op: str) -> None:
+            """造操作按钮：文字带序号，op 映射与互斥登记照旧。"""
+            btn = ttk.Button(parent, text=label,
+                             command=lambda op=op: self._launch(op))
+            btn.pack(side="left", padx=3, pady=2)
+            self._buttons[label] = btn
+
+        # 第 1 步：登录网站（每个网站只需一次）
+        step1 = ttk.LabelFrame(
+            body, text="第 1 步：登录网站（每个网站只需一次）")
+        step1.pack(fill="x", padx=2, pady=(2, 4))
+        ttk.Label(step1, text="站点/网址").pack(side="left", padx=(6, 0))
         self.site_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.site_var, width=22).pack(
-            side="left", padx=(4, 12))
-        ttk.Label(top, text="名称").pack(side="left")
+        ttk.Entry(step1, textvariable=self.site_var, width=22).pack(
+            side="left", padx=(4, 12), pady=3)
+        add_button(step1, "① 登录", "login")
+        add_button(step1, "验活", "doctor")
+
+        # 第 2 步：抓数据（两条路选一条）
+        step2 = ttk.LabelFrame(body, text="第 2 步：抓数据（两条路选一条）")
+        step2.pack(fill="x", padx=2, pady=4)
+        ttk.Label(step2, text="2A 临时抓一页：打开窗口 → 逛到目标页 → 取当前页"
+                  ).pack(anchor="w", padx=(6, 0))
+        ttk.Label(step2, text="2B 反复自动抓：录制 → 逛+按P框选 → 关窗起名"
+                  ).pack(anchor="w", padx=(6, 0))
+        row_a = ttk.Frame(step2)
+        row_a.pack(fill="x", pady=(2, 0))
+        add_button(row_a, "打开窗口", "open")
+        add_button(row_a, "③ 取当前页", "grab")
+        add_button(row_a, "② 录制", "record")
+        add_button(row_a, "④ 重放", "run")
+        row_b = ttk.Frame(step2)
+        row_b.pack(fill="x", pady=(2, 3))
+        ttk.Label(row_b, text="名称").pack(side="left", padx=(6, 0))
         self.name_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.name_var, width=14).pack(
+        ttk.Entry(row_b, textvariable=self.name_var, width=14).pack(
             side="left", padx=(4, 12))
-        ttk.Label(top, text="流程/recipe").pack(side="left")
+        ttk.Label(row_b, text="流程/recipe").pack(side="left")
         self.pick_var = tk.StringVar()
-        self.pick_box = ttk.Combobox(top, textvariable=self.pick_var,
+        self.pick_box = ttk.Combobox(row_b, textvariable=self.pick_var,
                                      width=20, values=[])
         self.pick_box.pack(side="left", padx=(4, 8))
-        self._buttons["刷新"] = ttk.Button(top, text="刷新",
+        self._buttons["刷新"] = ttk.Button(row_b, text="刷新",
                                            command=self.refresh_names)
-        self._buttons["刷新"].pack(side="left")
+        self._buttons["刷新"].pack(side="left", padx=3)
         self.headless_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="无头重放",
+        ttk.Checkbutton(row_b, text="无头重放",
                         variable=self.headless_var).pack(side="left", padx=(12, 0))
 
-        grid = ttk.Frame(self.root)
-        grid.pack(fill="x", padx=8, pady=4)
-        actions = [("登录", "login"), ("验活", "doctor"),
-                   ("打开窗口", "open"), ("录制", "record"), ("重放", "run"),
-                   ("导出", "export"), ("结果", "results"),
-                   ("流程列表", "flows"), ("recipe列表", "recipes"),
-                   ("关闭守护", "shutdown"), ("取当前页", "grab")]
-        for i, (label, op) in enumerate(actions):
-            btn = ttk.Button(grid, text=label,
-                             command=lambda op=op: self._launch(op))
-            btn.grid(row=i // 5, column=i % 5, sticky="ew", padx=3, pady=2)
-            grid.columnconfigure(i % 5, weight=1)
-            self._buttons[label] = btn
+        # 第 3 步：看结果
+        step3 = ttk.LabelFrame(body, text="第 3 步：看结果")
+        step3.pack(fill="x", padx=2, pady=4)
+        add_button(step3, "结果", "results")
+        add_button(step3, "流程列表", "flows")
+        add_button(step3, "recipe列表", "recipes")
+        add_button(step3, "导出", "export")
+
+        # 管理（低频）
+        admin = ttk.LabelFrame(body, text="管理（低频）")
+        admin.pack(fill="x", padx=2, pady=(4, 2))
+        add_button(admin, "关闭守护", "shutdown")
 
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=8)
@@ -268,7 +222,7 @@ class App:
                                      state="disabled")
         self.cancel_btn.pack(side="right")
 
-        self.log = scrolledtext.ScrolledText(self.root, height=18,
+        self.log = scrolledtext.ScrolledText(self.root, height=14,
                                              state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
@@ -446,31 +400,10 @@ class App:
 
     def _open_preview(self, csv_path: str, columns: list[str],
                       rows: list[list[str]], truncated: bool) -> None:
-        """建只读预览窗：Treeview 表格 + 横竖滚动条 + 底部落账标签；
-        每次收获弹一个新 Toplevel 互不替换，数据只读不回写 CSV。"""
-        win = tk.Toplevel(self.root)
-        win.title(f"数据预览：{Path(csv_path).name}")
-        frame = ttk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        tree = ttk.Treeview(frame, columns=columns, show="headings", height=18)
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=110, anchor="w")
-        for row in rows:  # 只读展示：插表后不回写 CSV
-            tree.insert("", "end", values=row)
-        ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        xsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        label = f"已保存：{Path(csv_path).resolve()}（{file_size_str(Path(csv_path))}）"
-        if truncated:
-            label += f"——仅显示前 {self.PREVIEW_ROWS} 行"
-        ttk.Label(win, text=label, anchor="w").pack(
-            fill="x", padx=8, pady=(0, 8))
+        """建只读预览窗：实现整体在 gui_preview.open_preview_window
+        （T18 拆分），这里只传 root 与行数上限，保持旧方法名可用。"""
+        open_preview_window(self.root, csv_path, columns, rows, truncated,
+                            self.PREVIEW_ROWS)
 
     def _on_close(self) -> None:
         """退出 GUI：子进程还在跑就先 SIGINT（安全收尾，录制不丢）再关窗。
@@ -489,7 +422,7 @@ def main() -> None:
     """GUI 入口：只有这里才建 Tk root 起主循环（import 本模块零副作用）。"""
     root = tk.Tk()
     root.title("pageplay 控制台")
-    root.geometry("780x520")
+    root.geometry("780x680")  # T18 向导四段比旧三段高，日志窗照旧 expand
     App(root)
     root.mainloop()
 
