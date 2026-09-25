@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import logging
 import subprocess
 import sys
 import time
@@ -205,6 +207,128 @@ def test_ensure_headful_attaches_headful_daemon(monkeypatch):
 def test_shutdown_without_daemon_returns_false(home_dir, monkeypatch):
     monkeypatch.setattr(session, "daemon_info", lambda: None)
     assert session.shutdown_browser() is False
+
+
+# ----------------------------------------------------------------------
+# T17：附着失败自愈（旧守护 × 新驱动协议不兼容 → 重启守护重试一次）
+# ----------------------------------------------------------------------
+
+def _protocol_error() -> RuntimeError:
+    """真机撞到的原样报错（venv 重建后新驱动附着一个活了一天多的旧守护）。"""
+    return RuntimeError(
+        "Protocol error (Browser.setDownloadBehavior): "
+        "Browser context management is not supported.")
+
+
+def test_attach_failure_self_heals_restart_daemon(daemon, monkeypatch, caplog):
+    """附着抛协议错 → 自动 shutdown 旧守护重起 → 第二次真连成功。
+
+    全程真 Chromium：恰好两次 connect（第一次打旧端口、第二次打新守护），
+    旧 pid 被杀，session.json 重写（pid 换新 + pw 诊断字段），日志含
+    "附着失败/自动重启"。
+    """
+    session.ensure_browser(headless=True)              # 先起一个活守护
+    old = json.loads((daemon / "session.json").read_text(encoding="utf-8"))
+    real_connect, calls = session.connect_cdp, []
+
+    def flaky(url: str):
+        calls.append(url)
+        if len(calls) == 1:
+            raise _protocol_error()
+        return real_connect(url)
+
+    monkeypatch.setattr(session, "connect_cdp", flaky)
+    with caplog.at_level(logging.INFO, logger="pageplay.session"):
+        browser = session.ensure_browser(headless=True)
+    new = json.loads((daemon / "session.json").read_text(encoding="utf-8"))
+    assert len(calls) == 2                             # 附着 + 自愈重试，仅一次
+    assert calls == [f"http://127.0.0.1:{old['port']}",
+                     f"http://127.0.0.1:{new['port']}"]
+    assert "附着失败" in caplog.text and "自动重启" in caplog.text
+    assert new["pid"] != old["pid"]                    # 旧守护被杀、起新守护
+    assert new["pw"] == importlib.metadata.version("playwright")
+    assert session._cdp_alive(new["port"]) and browser.contexts
+    deadline = time.monotonic() + 8
+    while session._pid_alive(old["pid"]) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not session._pid_alive(old["pid"])          # 旧守护确实死了
+
+
+def test_attach_failure_retry_also_fails_keeps_shutdown_hint(
+        home_dir, monkeypatch):
+    """自愈重试仍失败：RuntimeError 保留 pageplay shutdown 人工兜底提示。"""
+    exe = home_dir / "chromium-fake"
+    home_dir.mkdir(parents=True, exist_ok=True)
+    exe.write_text("", encoding="utf-8")               # 可执行检查只要文件在
+
+    class FakeChromium:
+        executable_path = str(exe)
+
+    class FakeDriver:
+        chromium = FakeChromium()
+
+    class FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    class FakeNS:
+        DEVNULL = subprocess.DEVNULL  # Popen 实参引用，值被桩吃掉
+
+        Popen = staticmethod(lambda *args, **kwargs: FakeProc())
+
+    calls: list[str] = []
+
+    def always_fail(url: str):
+        calls.append(url)
+        raise _protocol_error()
+
+    monkeypatch.setattr(session, "daemon_info",
+                        lambda: {"port": 59968, "pid": 1, "headless": False})
+    monkeypatch.setattr(session, "shutdown_browser", lambda: True)
+    monkeypatch.setattr(session, "_driver", lambda: FakeDriver())
+    monkeypatch.setattr(session, "_cdp_alive", lambda _port: True)
+    monkeypatch.setattr(session, "subprocess", FakeNS)
+    monkeypatch.setattr(session, "connect_cdp", always_fail)
+    with pytest.raises(RuntimeError, match="shutdown"):
+        session.ensure_browser(headless=True)
+    assert len(calls) == 2                             # 第一次附着 + 自愈重试
+    assert not (home_dir / "session.json").exists()    # 失败路径不写脏数据
+
+
+def test_attach_failure_self_heal_orchestration(monkeypatch, caplog):
+    """自愈编排语义（替身）：附着失败 → shutdown → 重走起守护 → 成功返回。"""
+    calls: list = []
+
+    def boom(_port: int):
+        calls.append("connect")
+        raise _protocol_error()
+
+    def fake_launch(headless: bool):
+        calls.append(f"launch:{headless}")
+        return "browser-new"
+
+    monkeypatch.setattr(session, "daemon_info",
+                        lambda: {"port": 59968, "pid": 1, "headless": False})
+    monkeypatch.setattr(session, "shutdown_browser",
+                        lambda: calls.append("shutdown") or True)
+    monkeypatch.setattr(session, "_connect", boom)
+    monkeypatch.setattr(session, "_launch_daemon", fake_launch)
+    with caplog.at_level(logging.INFO, logger="pageplay.session"):
+        assert session.ensure_browser(headless=True) == "browser-new"
+    assert calls == ["connect", "shutdown", "launch:True"]
+    assert "自动重启" in caplog.text
+
+
+def test_attach_rewrites_pw_diagnostic_field(daemon):
+    """成功附着后重写 session.json：port/pid 不变，pw=当前驱动版本（诊断）。"""
+    session.ensure_browser(headless=True)
+    before = json.loads((daemon / "session.json").read_text(encoding="utf-8"))
+    session.ensure_browser(headless=True)              # 幂等附着
+    after = json.loads((daemon / "session.json").read_text(encoding="utf-8"))
+    assert after["port"] == before["port"] and after["pid"] == before["pid"]
+    assert after["pw"] == importlib.metadata.version("playwright")
 
 
 # ----------------------------------------------------------------------

@@ -8,13 +8,13 @@ connect_over_cdp 附着干活。命令结束只关自己开的页（page.close()
 一个档案（cookie 本就按域隔离）；state.json/meta.json/recipes/runs
 语义不变；旧 sites/<site>/browser-profile 不再读写也不删。
 
-风控人机协作 ensure_logged_in：自动化被弹回登录页时，开站点首页、
-终端提示人在窗口里完成登录/验证，每 2s 轮询登录标记（至多 120s），
-通过即自动续跑原流程——半自动业务，会话生命周期归人。
+风控人机协作 ensure_logged_in：被弹回登录页时开站点首页、提示人在窗口
+完成登录/验证（2s 轮询至多 120s），通过自动续跑——半自动，生命周期归人。
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import os
@@ -78,6 +78,13 @@ def _session_file() -> Path:
     return _home_dir() / _SESSION_FILENAME
 
 
+def _write_session(port: int, pid: int, headless: bool) -> None:
+    """写 session.json（成功附着/起守护后）；pw=playwright 驱动版本，仅诊断。"""
+    data = {"port": port, "pid": pid, "headless": headless,
+            "pw": importlib.metadata.version("playwright")}
+    _session_file().write_text(json.dumps(data) + "\n", encoding="utf-8")
+
+
 def _cdp_alive(port: int) -> bool:
     """调试端口探活：GET /json/version 通即活（网络/端口错误一律判死）。"""
     try:
@@ -98,8 +105,7 @@ def _free_port() -> int:
 def daemon_info() -> dict | None:
     """读 session.json 并验活：活守护返回 {"port","pid","headless"}。
 
-    pid 已死、调试端口无响应、文件缺失或损坏 → 清理残留（文件删掉）
-    并返回 None。这是"附着 or 起守护"判定的唯一入口。
+    pid 已死、端口无响应、文件缺失/损坏 → 清残留返回 None（附着判定唯一入口）。
     """
     path = _session_file()
     try:
@@ -120,8 +126,7 @@ def daemon_info() -> dict | None:
 def _driver():
     """惰性启动 playwright 驱动（进程级单例；CLI 进程退出随之消亡）。
 
-    不调 .stop()：驱动进程随 CLI 退出即可，脱守护的浏览器不受影响
-    （connect_over_cdp 断开不杀浏览器，这正是常驻模型的基础）。
+    不调 .stop()：connect_over_cdp 断开不杀浏览器，驱动随 CLI 退出即可（常驻基础）。
     """
     global _PW
     if _PW is None:
@@ -132,10 +137,15 @@ def _driver():
 _PW = None
 
 
+def connect_cdp(url: str) -> Browser:
+    """CDP 连接动作收敛于此（驱动惰性单例起在 _driver；测试 monkeypatch 点）。"""
+    return _driver().chromium.connect_over_cdp(url)
+
+
 def _connect(port: int) -> Browser:
     """CDP 附着活守护；失败包装为人话 RuntimeError。"""
     try:
-        return _driver().chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        return connect_cdp(f"http://127.0.0.1:{port}")
     except Exception as exc:
         raise RuntimeError(
             f"附着常驻浏览器失败（port={port}）：{exc}；"
@@ -167,20 +177,29 @@ def _terminate_pid(pid: int) -> None:
 
 def ensure_browser(headless: bool = False) -> Browser:
     """附着活守护，没有则起一个脱离的守护浏览器再附着（幂等）。
-
-    顺序：daemon_info 验活附着 → 起守护（chromium 可执行文件直接
-    Popen，start_new_session 脱离父进程，命令退出浏览器不死）→ 轮询
-    /json/version 至多 30s → connect_over_cdp → 写 session.json。
-    任何一步失败：清理残留并抛带人话指引的 RuntimeError（内核缺失时
-    提示 playwright install chromium）。
+    附着失败（旧守护×新驱动协议不兼容、验活后连接中断等）自愈一次：
+    shutdown 杀旧守护清 session.json → 重走 _launch_daemon 再附着；重试
+    再失败向上抛（经 _connect 保留 shutdown 人工兜底提示）。
     """
     info = daemon_info()
-    if info is not None:
-        log.info("daemon: 附着活守护（port=%s pid=%s headless=%s）",
-                 info["port"], info["pid"], info["headless"])
-        return _connect(info["port"])
+    if info is None:
+        return _launch_daemon(headless)
+    log.info("daemon: 附着活守护 %s", info)
+    try:
+        browser = _connect(info["port"])
+    except Exception as exc:
+        log.warning("daemon: 附着失败（%s），自动重启守护…", exc)
+        shutdown_browser()
+        browser = _launch_daemon(headless)
+        log.info("daemon: 守护已自动重启")
+        return browser
+    _write_session(info["port"], info["pid"], info["headless"])
+    return browser
 
-    _session_file().unlink(missing_ok=True)  # daemon_info 已清，双保险
+
+def _launch_daemon(headless: bool) -> Browser:
+    """起脱离的守护浏览器并附着（首次起守护与附着失败自愈共用）。"""
+    _session_file().unlink(missing_ok=True)  # 前序已清，双保险
     executable = _driver().chromium.executable_path
     if not Path(executable).exists():
         raise RuntimeError(
@@ -206,9 +225,7 @@ def ensure_browser(headless: bool = False) -> Browser:
     while time.monotonic() < deadline:
         if _cdp_alive(port):
             browser = _connect(port)
-            _session_file().write_text(json.dumps({
-                "port": port, "pid": proc.pid, "headless": headless,
-            }) + "\n", encoding="utf-8")
+            _write_session(port, proc.pid, headless)
             log.info("daemon: 守护就绪，session.json 已写入")
             return browser
         if proc.poll() is not None:
@@ -227,8 +244,7 @@ def ensure_browser(headless: bool = False) -> Browser:
 def ensure_headful_browser() -> Browser:
     """login/pick/open 用：保证有头活窗（无头守护先换成有头）。
 
-    无守护 → 起有头；有头守护 → 直接附着；无头守护（定时任务留下的）→
-    shutdown 后起有头——人工交互类命令必须有可见窗口。
+    无守护→起有头；有头→直接附着；无头（定时任务留下的）→shutdown 后起有头。
     """
     info = daemon_info()
     if info is not None and info["headless"]:
