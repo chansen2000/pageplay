@@ -10,6 +10,12 @@
 list_mode/fields 原样透进步 dict，v0.7 收口）后清标记回浏览。
 点击步落账后 3s 内的导航（framenavigated）把落点 URL 补进 note。
 
+T16 页面反馈（盲操作治理）：录制布防时页面右上角 REC 角标（「● 录制中」
++ 可点的「框选」按钮 = 等价按 P）+ hover 1px 虚线轻高亮（outline 不改
+布局不拦截，INPUT/TEXTAREA/角标/覆层豁免）+ 进框选顶部弹条（锁定或
+取消随 picking 标记消失）。全部 append + 移除、不改业务 DOM，随会话
+结束由 __pageplay_rec_cleanup 一并拆掉。
+
 退出语义：关窗 / 空闲 600s 无交互 / Ctrl-C——已收 ≥1 步正常返回全部，
 一条没收 raise PickCancelled。Esc 只取消当前框选回浏览模式，不结束会话。
 
@@ -36,8 +42,9 @@ _RECORD_IDLE_TIMEOUT_SEC = 600  # 空闲无交互兜底（人机交互，给足�
 _NAV_MERGE_SEC = 3              # 点击步落账后等落点导航的窗口
 
 # 注入 JS（IIFE，幂等单实例，复用 picker 的模式）：点击被动记录 + P 键
-# 进框选子模式。picking 标记挂 window（python 确认/Esc 后清标记回浏览；
-# 测试也据此观测子模式），新文档加载即回浏览态。
+# 进框选子模式 + T16 页面反馈三件套（REC 角标 / hover 轻高亮 / 框选弹条）。
+# picking 标记挂 window（python 确认/Esc 后清标记回浏览；测试也据此观测
+# 子模式），新文档加载即回浏览态。
 _RECORDER_JS = """
 (() => {
   if (window.__pageplay_rec_cleanup) { try { window.__pageplay_rec_cleanup(); } catch (e) {} }
@@ -83,6 +90,7 @@ _RECORDER_JS = """
     const t = e.target;
     if (!t || t.nodeType !== 1) return;
     if (t.closest && t.closest("#__pageplay_overlay")) return;  // 覆层 UI 不记
+    if (t.closest && t.closest("#__pageplay_rec_badge")) return;  // 角标 UI 不记
     const a = t.closest ? t.closest("a[href]") : null;
     send({
       kind: "click",
@@ -91,20 +99,108 @@ _RECORDER_JS = """
       url: location.href,
     });
   }
+
+  // ── T16 页面反馈三件套 ──
+  // REC 角标（浏览态在，右上角，只有「框选」按钮可点）+ 框选弹条（子模式在，
+  // 顶部居中）+ hover 轻高亮（1px 虚线 outline，不改布局不拦截）。三者全是
+  // append + 移除、不改业务 DOM；角标/弹条显隐由 500ms 心跳同步 picking 标记
+  // （覆盖 python 侧 _resume_browse 直接清标记的回浏览路径），进/出子模式时
+  // 另有即时切换，不等人。
+  let badge = null, banner = null, fbTimer = 0, hov = null, hovPrev = "";
+
+  function hoverable(t) {  // 豁免：输入框 / 角标 / 弹条 / picker 覆层自身
+    if (!t || t.nodeType !== 1) return false;
+    if (t.tagName === "INPUT" || t.tagName === "TEXTAREA") return false;
+    return !(t.closest && (t.closest("#__pageplay_rec_badge")
+      || t.closest("#__pageplay_rec_banner")
+      || t.closest("#__pageplay_overlay")));
+  }
+  function clearHov() {
+    if (!hov) return;
+    hov.style.outline = hovPrev;  // 还原行内 outline（原本没设是 ""，等于清除）
+    hov = null; hovPrev = "";
+  }
+  function onOver(e) {
+    if (window.__pageplay_picking || e.target === hov) return;
+    clearHov();
+    const t = e.target;
+    if (!hoverable(t)) return;
+    hov = t;
+    hovPrev = t.style.outline || "";
+    t.style.outline = "1px dashed #e5484d";
+  }
+  function onOut(e) { if (e.target === hov) clearHov(); }
+  function syncFeedback() {  // 浏览态：角标在弹条藏；框选子模式：反之
+    if (!badge || !banner) return;
+    const picking = !!window.__pageplay_picking;
+    badge.style.display = picking ? "none" : "flex";
+    banner.style.display = picking ? "block" : "none";
+  }
+  function enterPick() {  // P 键与角标按钮共用的进框选入口（两者等价）
+    if (window.__pageplay_picking) return;
+    clearHov();  // 带着高亮进框选会与 overlay 红框打架，先进掉
+    window.__pageplay_picking = true;
+    syncFeedback();
+    send({kind: "pick"});
+  }
+  function buildFeedback() {  // 角标+弹条挂 body（半透明不挡操作，仅按钮可点）
+    if (!document.body) return;
+    badge = document.createElement("div");
+    badge.id = "__pageplay_rec_badge";
+    badge.style.cssText = "position:fixed;top:8px;right:8px;z-index:2147483644;"
+      + "display:flex;align-items:center;gap:5px;padding:2px 4px 2px 10px;"
+      + "background:rgba(0,0,0,.45);border-radius:12px;color:#fff;"
+      + "font:12px/1.8 -apple-system,sans-serif;pointer-events:none;opacity:.85;";
+    badge.innerHTML = '<span style="color:#e5484d;">●</span><span>录制中</span>';
+    const btn = document.createElement("button");
+    btn.textContent = "框选";
+    btn.style.cssText = "pointer-events:auto;cursor:pointer;color:#fff;"
+      + "background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.7);"
+      + "border-radius:10px;padding:0 9px;font:12px/1.8 -apple-system,sans-serif;";
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      enterPick();
+    });
+    badge.appendChild(btn);
+    document.body.appendChild(badge);
+    banner = document.createElement("div");
+    banner.id = "__pageplay_rec_banner";
+    banner.textContent = "框选模式：红框罩住目标后单击锁定（Esc 返回浏览）";
+    banner.style.cssText = "position:fixed;top:12px;left:50%;"
+      + "transform:translateX(-50%);z-index:2147483644;display:none;"
+      + "pointer-events:none;background:rgba(229,72,77,.92);color:#fff;"
+      + "border-radius:6px;padding:5px 14px;"
+      + "font:13px/1.8 -apple-system,sans-serif;";
+    document.body.appendChild(banner);
+    if (!fbTimer) fbTimer = setInterval(syncFeedback, 500);
+    syncFeedback();
+  }
+
   function onKey(e) {
     if (window.__pageplay_picking) return;  // 框选中按键归 picker overlay
     const ae = document.activeElement;
     if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
-    if (e.key === "p" || e.key === "P") {
-      window.__pageplay_picking = true;
-      send({kind: "pick"});
-    }
+    if (e.key === "p" || e.key === "P") enterPick();
   }
   document.addEventListener("click", onClick, {capture: true, passive: true});
   document.addEventListener("keydown", onKey, {capture: true});
+  document.addEventListener("mouseover", onOver, {capture: true});
+  document.addEventListener("mouseout", onOut, {capture: true});
+  if (document.readyState === "loading") {  // init 脚本先于 body：等 DOM 再挂
+    document.addEventListener("DOMContentLoaded", buildFeedback, {once: true});
+  } else {
+    buildFeedback();
+  }
   window.__pageplay_rec_cleanup = () => {
     document.removeEventListener("click", onClick, {capture: true});
     document.removeEventListener("keydown", onKey, {capture: true});
+    document.removeEventListener("mouseover", onOver, {capture: true});
+    document.removeEventListener("mouseout", onOut, {capture: true});
+    clearInterval(fbTimer); fbTimer = 0;
+    clearHov();
+    if (badge) { badge.remove(); badge = null; }
+    if (banner) { banner.remove(); banner = null; }
   };
 })();
 """

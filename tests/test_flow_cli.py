@@ -21,6 +21,7 @@ from pageplay.runs import load_runs, record_run
 
 from fakes_browser import (
     PickPage,
+    RunPage,
     fake_downloads_home,
     install_browser,
 )
@@ -372,3 +373,50 @@ def test_json_keeps_non_ascii_and_text_path_unchanged(home_dir, capsys):
     assert main(["flows"]) == 0  # 人类文本路径零回归
     out = capsys.readouterr().out
     assert "中文流程" in out and "已保存流程" in out
+
+
+# ----------------------------------------------------------------------
+# T16：启动步骤卡（CLI 是唯一真相源，GUI 日志窗经 stdout 自动透传）
+# ----------------------------------------------------------------------
+
+def test_record_prints_step_card_on_start(home_dir, tmp_path, monkeypatch, capsys):
+    """record 启动打录制步骤卡：浏览 / P 键与「框选」按钮 / 落地 / 结束起名。"""
+    _write_saved_site(home_dir)
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = RecordPage(_START, table=_TABLE)
+    install_browser(monkeypatch, page)
+    monkeypatch.setattr("pageplay.recorder.record_session", lambda p, s, h: [])
+    assert main(["record", "faketest"]) == 1
+    out = capsys.readouterr().out
+    assert "── 录制步骤 ──" in out
+    assert "在弹出的浏览器里正常浏览" in out
+    assert "按 P 键" in out and "「框选」按钮" in out
+    assert "抓到的数据当场落地" in out
+    assert "给流程起名（留空自动命名）" in out
+
+
+def test_run_prints_step_card_for_flow_and_recipe(home_dir, tmp_path,
+                                                  monkeypatch, capsys):
+    """run 启动打执行步骤卡：整链与单条 recipe 两条重放路径都打，各一次。"""
+    _seed_flow(home_dir, "cardflow")
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = RunPage(table=_TABLE)  # 流程路径打桩不碰页；recipe 路径要等选择器
+    install_browser(monkeypatch, page)
+    monkeypatch.setattr("pageplay.runner.run_flow",
+                        lambda *a, **k: {"ok": True, "failed_step": None,
+                                         "results": []})
+
+    assert main(["run", "cardflow", "--out", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "── 执行步骤 ──" in out
+    assert "已按流程逐步执行" in out
+    assert "被弹登录页时去窗口里过一下验证" in out
+    assert "产物路径最后列出" in out
+    assert out.count("── 执行步骤 ──") == 1  # 一条命令只打一张卡
+
+    save_recipe(home_dir / "sites" / "faketest", {  # _seed_flow 已建站点目录
+        "version": 1, "name": "cardrecipe", "site": "faketest", "url": _START,
+        "action": "table", "selector": "#t1", "columns": ["名称"],
+    })
+    assert main(["run", "cardrecipe"]) == 0
+    assert "── 执行步骤 ──" in capsys.readouterr().out  # 单条 recipe 路径同卡

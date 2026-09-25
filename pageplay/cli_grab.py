@@ -72,7 +72,10 @@ def _cmd_grab(args: argparse.Namespace) -> int:
     site_arg = str(args.site or "").strip()  # 空白等价于没给
     label = (_label_from_site_arg(site_arg) if site_arg
              else _label_from_page_url(page.url))
-    print(f"将从此页取数据：{title or '（无标题）'}（{page.url}）")
+    print("── 框选步骤 ──\n1. 在当前页把鼠标移到目标上\n2. 红框罩住后单击锁定\n"
+          "3. 勾列/勾字段 → 确认 → 数据落地\n─────────────")
+    # T16 框选注入位置明示：title 不对 = 人关错页重试，不再盲猜
+    print(f"框选已激活在标签页：{title or '（无标题）'}（{page.url[:60]}）")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = _products_root() / "grab" / f"{stamp}-{label}"

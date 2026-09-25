@@ -233,6 +233,8 @@ def _cmd_pick(args: argparse.Namespace) -> int:
         return 1
     site_dir = _cli._site_dir(site.name)
     base_name = args.name or f"{site.name}-{len(recipes.list_recipes(site_dir)) + 1}"
+    print("── 框选步骤 ──\n1. 在当前页把鼠标移到目标上\n2. 红框罩住后单击锁定\n"
+          "3. 勾列/勾字段 → 确认 → 数据落地\n─────────────")
 
     browser = ensure_headful_browser()
     context = browser.contexts[0]
@@ -248,6 +250,11 @@ def _cmd_pick(args: argparse.Namespace) -> int:
 
     try:
         page.goto(pasted_url or site.home_url)
+        try:
+            ptitle = page.title() or "（无标题）"
+        except Exception:
+            ptitle = "（无标题）"  # 替身页面/内建页无 title：不挡框选
+        print(f"框选已激活在标签页：{ptitle}（{page.url[:60]}）")
         picker.run_pick(page, _handler, repeat=True)
     except picker.PickCancelled as exc:
         print(f"已取消：{exc}")
@@ -296,6 +303,12 @@ def _cmd_record(args: argparse.Namespace) -> int:
             print(f"✗ {detail}", file=sys.stderr)
             return 1
         start_url = page.url
+        print("── 录制步骤 ──\n"
+              "1. 在弹出的浏览器里正常浏览（点链接、翻页都会自动记录）\n"
+              "2. 想抓数据：按 P 键（或点页面右上角的「框选」按钮）→ 红框高亮目标 → 单击锁定 → 勾字段 → 确认\n"
+              "3. 抓到的数据当场落地，路径显示在这里\n"
+              "4. 结束：关闭该标签页或点「取消」→ 给流程起名（留空自动命名）\n"
+              "─────────────")
 
         def _on_step(step: dict) -> None:
             print(f"已记步骤 {step['no']}：{step['kind']} {step['selector']}")
@@ -398,11 +411,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     """
     flow_dir = next((d for d in _cli._flow_site_dirs()
                      if (d / "flows" / f"{args.name}.json").is_file()), None)
-    if flow_dir is not None:
-        return _run_flow_by_name(args, flow_dir)
     site_dir = next((d for d in _cli._recipe_site_dirs()
                      if (d / "recipes" / f"{args.name}.json").is_file()), None)
-    if site_dir is None:
+    if flow_dir is None and site_dir is None:
         flow_names = sorted(str(f["name"]) for d in _cli._flow_site_dirs()
                             for f in flows.list_flows(d))
         recipe_names = sorted(str(r["name"]) for d in _cli._recipe_site_dirs()
@@ -413,6 +424,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
               f"现有流程：{flow_known}；现有 recipe：{recipe_known}",
               file=sys.stderr)
         return 1
+    print("── 执行步骤 ──\n1. 已按流程逐步执行\n"
+          "2. 被弹登录页时去窗口里过一下验证\n"
+          "3. 产物路径最后列出\n─────────────")
+    if flow_dir is not None:
+        return _run_flow_by_name(args, flow_dir)
     recipe = recipes.load_recipe(site_dir, args.name)
     try:
         site = _cli._resolve_target(recipe["site"])

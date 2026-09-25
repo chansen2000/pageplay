@@ -120,7 +120,9 @@ def test_grab_takes_last_page_executes_and_records(home_dir, tmp_path,
 
     assert headless_calls == [False]              # 附着有头活窗（不换守护）
     out = capsys.readouterr().out
-    assert "将从此页取数据：列表页" in out and _URL in out
+    assert "── 框选步骤 ──" in out and "勾列/勾字段" in out  # T16 启动步骤卡
+    # T16 注入位置明示：title + url 前 60 字（本例全量 < 60）
+    assert f"框选已激活在标签页：列表页（{_URL}）" in out
     grab_root = fake_home / "Downloads" / "pageplay" / "grab"
     (grab_dir,) = grab_root.glob("*-faketest")    # <时间戳>-<站>
     products = sorted(grab_dir.glob("faketest-grab-*.csv"))
@@ -147,7 +149,7 @@ def test_grab_without_site_labels_from_page_url(home_dir, tmp_path,
 
     (entry,) = load_runs(_runs_path())
     assert entry["recipe"] == "taobao-grab"       # 域名推导只影响命名
-    assert "将从此页取数据" in capsys.readouterr().out
+    assert "框选已激活在标签页" in capsys.readouterr().out
 
 
 def test_grab_download_action_saves_file(home_dir, tmp_path, monkeypatch):

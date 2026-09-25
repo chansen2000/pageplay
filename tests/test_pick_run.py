@@ -73,6 +73,27 @@ def test_pick_confirm_table_executes_immediately(home_dir, table_site, tmp_path,
     assert recipe["action"] == "table" and recipe["columns"] == ["名称", "价格"]
 
 
+def test_pick_prints_step_card_and_injection_tab(home_dir, table_site, tmp_path,
+                                                 monkeypatch, capsys):
+    """T16：pick 启动打框选步骤卡 + 注入位置明示（替身页无 title 回落占位）。"""
+    _write_saved_site(home_dir, name="faketest")
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = PickPage(table_site + "/table")
+    install_browser(monkeypatch, page)
+    monkeypatch.setattr("pageplay.picker.run_pick",
+                        lambda p, on_confirm, repeat=False: [])
+
+    assert main(["pick", "faketest"]) == 0
+
+    out = capsys.readouterr().out
+    assert "── 框选步骤 ──" in out
+    assert "在当前页把鼠标移到目标上" in out
+    assert "红框罩住后单击锁定" in out
+    assert "勾列/勾字段 → 确认 → 数据落地" in out
+    # 注入位置明示：title 取不到回落（无标题），url 打前 60 字
+    assert f"框选已激活在标签页：（无标题）（{table_site + '/table'}）" in out
+
+
 def test_pick_repeat_two_confirms_saves_two_recipes_and_summary(
         home_dir, table_site, tmp_path, monkeypatch, capsys):
     """repeat 会话：替身确认两条 → 两条 recipe 各自落盘落账，摘要列两条名字。"""
