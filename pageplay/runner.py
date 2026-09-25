@@ -16,7 +16,8 @@ flow 结构（设计 §12，flows.py 数据层落盘）：{"name", "site", "url"
   实现，避免 runner 反向依赖 CLI 层（T11d 会从 cli 侧调进来，顶层
   互相 import 会成环）。
 - click：等选择器（15s）→ 点击 → 等 1s 稳定。
-- table：等选择器 → extract_table → save_table，产物名 <stem>-<no>。
+- table：等选择器 → 按 list_mode 分派 extract_table（缺省）/
+  extract_cards（"cards"，用 step["fields"]）→ save_table，产物名 <stem>-<no>。
 - download：等选择器 → download_element 落盘。
 每步后 check_page_risk：命中且不在登录页 → RiskTriggered 向上抛
 （真风控照旧停机，退出码语义归调用方）；命中但落在登录页 = 中途被
@@ -140,10 +141,16 @@ def _run_step(page, browser, flow: dict, step: dict, out_dir: Path,
         time.sleep(1.0)  # 等点击跳转/渲染稳定，下一步在落点上继续
         detail = f"已点击 {selector}，落点 {page.url}"
     elif kind == "table":
-        rows = actions.extract_table(page, selector, step.get("columns"))
+        if str(step.get("list_mode") or "table") == "cards":  # v0.7-A 卡片列表
+            rows = actions.extract_cards(page, selector,
+                                         step.get("fields") or [])
+            what = "抓卡片"
+        else:
+            rows = actions.extract_table(page, selector, step.get("columns"))
+            what = "抓表"
         csv_path, json_path = actions.save_table(
             rows, out_dir, stem=f"{flow_stem}-{step['no']}")
-        detail = f"已生成：抓表 {len(rows)} 行 → {csv_path}、{json_path}"
+        detail = f"已生成：{what} {len(rows)} 行 → {csv_path}、{json_path}"
     elif kind == "download":
         target = actions.download_element(page, selector, out_dir)
         detail = (f"已生成 {target.resolve()}"

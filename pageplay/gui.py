@@ -1,18 +1,15 @@
 """Tkinter 控制台：GUI 只是壳，实际执行同一套 pageplay CLI（sheng 拍板）。
 
 本文件不实现任何引擎逻辑：每个按钮经 build_command 拼出 argv，子进程跑
-与终端完全相同的 pageplay 命令（cli.main），输出逐行回读进日志窗。不改
-引擎行为；PAGEPLAY_HOME 等环境变量原样透传给子进程（Popen 继承 os.environ，
-仅追加 PYTHONUNBUFFERED 让日志行实时到达，不做任何特殊处理）。
-
-线程模型（tkinter 唯一安全做法）：子进程在后台 daemon 线程逐行读
-stdout → queue.Queue → 主线程 after(100ms) 轮询刷 UI；tkinter 控件只在
-主线程碰。运行期互斥：全部按钮 disabled + 状态栏"执行中…"；结束恢复并
-自动刷新下拉（flows/recipes --json 机读数组）。「取消」= SIGINT（POSIX
-等同 Ctrl-C：record 走 KeyboardInterrupt 路径安全保存流程后再退，T13；
-3s 仍活才升级 terminate 兜底）；退出 GUI 时对在跑子进程同样先 SIGINT
-再关窗。「录制」名称留空自动起默认名并回填输入框（T13.3 防丢），启动
-时打三行录制提示。
+与终端完全相同的 pageplay 命令（cli.main），输出逐行回读进日志窗；不改
+引擎行为，PAGEPLAY_HOME 等环境变量原样透传（仅追加 PYTHONUNBUFFERED）。
+线程模型（tkinter 唯一安全做法）：后台 daemon 线程逐行读 stdout 入
+queue，主线程 after(100ms) 轮询刷 UI，控件只在主线程碰；运行期互斥按钮
+全 disabled，结束恢复并自动刷新下拉（--json 机读数组）。「取消」= SIGINT
+安全收尾（T13 契约，详见 _cancel / _on_close）。「录制」名称留空自动起
+默认名并回填输入框（T13.3 防丢）。v0.7-B 起命令正常结束扫执行账本弹
+CSV 只读预览窗；v0.7 收紧为只在账本新增记录时弹（_launch 记行数基线 →
+_on_done 比对 should_preview），doctor 等无收获命令不再反复弹旧 CSV。
 """
 
 from __future__ import annotations
@@ -30,6 +27,8 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import scrolledtext, ttk
+
+from .actions import file_size_str
 
 # 子进程命令前缀：同一解释器、同一 CLI 入口（cli.main），退出码原样透传。
 # 用 -c 而不是 -m，因为 cli.py 没有也不需要 __main__ 块。
@@ -55,13 +54,12 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     op ∈ {login, doctor, open, record, run, export, results, flows,
     recipes, shutdown, grab}；params 只认三个键：site_or_url（顶部站点/网址
     输入框）、name（名称输入框，record 时作 --name；run 时作重放名）、
-    headless（run 时作 --headless）。多余的键忽略。
+    headless（run 时作 --headless）。多余的键忽略；非法 op → ValueError。
     - login/doctor/open/record/export 必填 site_or_url，缺 → ValueError
     - grab 站点可选（给了才传：仅用于命名与落账归属）
     - run 必填 name（下拉选中的流程/recipe 名），缺 → ValueError
     - record 有 name 才传 --name（GUI 侧由 next_record_name 保证非空）
     - run 有 headless 才传 --headless
-    非法 op → ValueError。
     """
     if op not in _OPERATIONS:
         raise ValueError(
@@ -93,8 +91,7 @@ def next_record_name(site: str, known_flows) -> str:
     站点标签与 CLI parse_target 同近似（www.taobao.com → taobao）；
     N 从已知流程清单（flows --json 的产物，refresh_names 维护）里同
     前缀最大号 +1；清单里没有同前缀（取不到 N）→ 时间戳后 4 位兜底。
-    站点推不出标签（空串等）返回 ""：调用方不自动命名，交
-    build_command 按缺站点报错。
+    站点推不出标签（空串等）返回 ""：交 build_command 按缺站点报错。
     """
     host = site.strip()
     if "://" in host:
@@ -115,21 +112,107 @@ def next_record_name(site: str, known_flows) -> str:
     return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')[-4:]}"
 
 
+def _runs_jsonl_path() -> Path:
+    """执行账本路径（GUI 只读不写）：与 cli_pick 同款，PAGEPLAY_HOME 覆盖。"""
+    return Path(os.environ.get("PAGEPLAY_HOME", "~/.pageplay")
+                ).expanduser() / "runs.jsonl"
+
+
+def latest_csv_output(runs_path: Path) -> str | None:
+    """账本最后一条有效记录的 .csv 产物路径；没有 → None。
+
+    从文件末尾向前找第一条能解析的记录（坏行——JSON 损坏/非对象——
+    跳过继续向前）；status=ok 且 outputs 里有 .csv（取最后一个）→
+    返回该路径，否则 None（fail / ok 无 csv / 不存在 / 空文件）。
+    只认最后一条有效记录，不回看更旧的收获。
+    """
+    runs_path = Path(runs_path)
+    if not runs_path.is_file():
+        return None
+    text = runs_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue  # 坏行跳过
+        if not isinstance(data, dict):
+            continue
+        outputs = data.get("outputs")
+        if data.get("status") == "ok" and isinstance(outputs, list):
+            for item in reversed(outputs):
+                if str(item).lower().endswith(".csv"):
+                    return str(item)
+        return None  # 最后一条有效记录说了算
+    return None
+
+
+def _count_runs(runs_path: Path) -> int:
+    """账本非空行数（读不了 → 0）；追加式账本：行数增长 = 新增了执行记录。"""
+    try:
+        text = Path(runs_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return sum(1 for ln in text.splitlines() if ln.strip())
+
+
+def should_preview(before: int, after: int) -> bool:
+    """预览闸门（纯函数）：账本行数有增长才值得弹预览（无增长 = 无新收获）。"""
+    return after > before
+
+
+def load_csv_for_preview(path: str, max_rows: int = 500
+                         ) -> tuple[list[str], list[list[str]]]:
+    """CSV → (表头, 行) 预览数据，值全文本，最多 max_rows 行。
+
+    pandas.read_csv(dtype=str, keep_default_na=False)：编号列保持文本
+    （"001" 不变形），空单元格是 ""；utf-8-sig 兼容 save_table 带 BOM
+    产物。不存在/空文件/解析失败 → ValueError（人话）。超 max_rows 只
+    返回前 max_rows 行；判"是否截断"用 max_rows+1 再读一次看是否多
+    返回一行（GUI 用此法打标记，不猜）。
+    """
+    csv_path = Path(path)
+    if not csv_path.is_file():
+        raise ValueError(f"找不到 CSV 文件：{csv_path}")
+    try:
+        import pandas  # 延迟导入：预览用到才加载，GUI 启动不背其开销
+    except ImportError as exc:
+        raise ValueError(f"预览需要 pandas（当前环境未安装）：{exc}") from exc
+    try:
+        df = pandas.read_csv(csv_path, dtype=str, keep_default_na=False,
+                             encoding="utf-8-sig", nrows=max(max_rows, 0))
+    except pandas.errors.EmptyDataError as exc:
+        raise ValueError(f"CSV 文件是空的：{csv_path}") from exc
+    except OSError as exc:
+        raise ValueError(f"读不了 CSV 文件：{csv_path}（{exc}）") from exc
+    except ValueError as exc:  # 解析失败（ParserError 是 ValueError 子类）
+        raise ValueError(f"不是有效的 CSV：{csv_path}（{exc}）") from exc
+    columns = [str(c) for c in df.columns]
+    rows = [[str(v) for v in row]
+            for row in df.itertuples(index=False, name=None)]
+    return columns, rows
+
+
 class App:
     """主窗口：顶（输入+下拉）／中（按钮网格）／底（日志窗）三段布局。
 
-    运行模型：_launch 起子进程与读线程 → _pump 逐行入队 → _poll 在主线程
-    消费队列刷日志/状态。队列元素：str = 一行日志；tuple = 控制消息
-    ("done", 退出码) 或 ("names", 来源, 名单)。
+    运行模型：_launch 起子进程与读线程 → _pump 逐行入队 → _poll 主线程
+    消费刷日志/状态。队列元素：str = 日志行；tuple = ("done", 码)
+    或 ("names", 来源, 名单)。
     """
 
     POLL_MS = 100
+    PREVIEW_ROWS = 500  # 预览窗最多展示的行数（v0.7-B）
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.queue: queue.Queue = queue.Queue()
         self.proc: subprocess.Popen | None = None
         self.cancelled = False
+        self._runs_before = 0  # 账本行数基线（_launch 记，_on_done 比对）
         self._buttons: dict[str, ttk.Button] = {}
         self._names: dict[str, list[str]] = {}  # {"flows": […], "recipes": […]}
         self._build_ui()
@@ -137,9 +220,7 @@ class App:
         root.after(self.POLL_MS, self._poll)
         self.refresh_names()
 
-    # ------------------------------------------------------------------
-    # 布局（三段）
-    # ------------------------------------------------------------------
+    # ---- 布局（三段）--------------------------------------------------
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root)
@@ -162,8 +243,7 @@ class App:
         self._buttons["刷新"].pack(side="left")
         self.headless_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="无头重放",
-                        variable=self.headless_var).pack(side="left",
-                                                         padx=(12, 0))
+                        variable=self.headless_var).pack(side="left", padx=(12, 0))
 
         grid = ttk.Frame(self.root)
         grid.pack(fill="x", padx=8, pady=4)
@@ -192,9 +272,7 @@ class App:
                                              state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
-    # ------------------------------------------------------------------
-    # 运行模型：起子进程 → 后台读 → 主线程刷
-    # ------------------------------------------------------------------
+    # ---- 运行模型：起子进程 → 后台读 → 主线程刷------------------------
 
     def _launch(self, op: str) -> None:
         """按钮统一入口：拼 argv → 起子进程 → 进入互斥运行态。"""
@@ -229,6 +307,7 @@ class App:
             self._log(f"启动失败：{exc}")
             return
         self.cancelled = False
+        self._runs_before = _count_runs(_runs_jsonl_path())  # 预览闸门基线
         self._set_running(True)
         threading.Thread(target=self._pump, args=(self.proc,),
                          daemon=True).start()
@@ -239,7 +318,6 @@ class App:
 
     def _pump(self, proc: subprocess.Popen) -> None:
         """后台线程：逐行读子进程 stdout 入队；结束后投递 ("done", 码)。
-
         线程里只碰 queue，不碰任何 tkinter 控件。
         """
         assert proc.stdout is not None
@@ -271,6 +349,8 @@ class App:
         else:
             self._log(f"— 退出码 {code} —")
             self.status_var.set(f"空闲（上次退出码 {code}）")
+            if should_preview(self._runs_before, _count_runs(_runs_jsonl_path())):
+                self._maybe_preview()  # v0.7 收紧：账本有新增且末条带 CSV 才弹
         self.refresh_names()  # 结束自动刷新下拉（--json 机读）
 
     def _cancel(self) -> None:
@@ -306,9 +386,7 @@ class App:
         if running:
             self.status_var.set("执行中…")
 
-    # ------------------------------------------------------------------
-    # 日志窗与下拉刷新
-    # ------------------------------------------------------------------
+    # ---- 日志窗与下拉刷新----------------------------------------------
 
     def _log(self, line: str) -> None:
         """追加一行（时间戳前缀）并滚动跟底；日志窗常态只读。"""
@@ -343,9 +421,59 @@ class App:
                         | set(self._names.get("recipes", [])))
         self.pick_box["values"] = merged
 
+    # ---- 数据预览（v0.7-B）：命令结束后账本有新增且带 CSV 才弹----------
+
+    def _maybe_preview(self) -> None:
+        """收获预览入口：账本最新 ok 记录里有 .csv → 弹预览窗 + 记日志。
+        只在 _on_done（子进程已结束、账本有新增）里调用；max_rows+1 多
+        读一行探截断，读到了才标"仅显示前 N 行"。预览是锦上添花：失败
+        只记一行日志，不弄崩控制台。
+        """
+        try:
+            csv_path = latest_csv_output(_runs_jsonl_path())
+            if not csv_path:
+                return
+            columns, rows = load_csv_for_preview(
+                csv_path, max_rows=self.PREVIEW_ROWS + 1)
+        except ValueError as exc:
+            self._log(f"数据预览跳过：{exc}")
+            return
+        truncated = len(rows) > self.PREVIEW_ROWS
+        rows = rows[:self.PREVIEW_ROWS]
+        note = f"，仅显示前 {self.PREVIEW_ROWS} 行" if truncated else ""
+        self._log(f"已弹出数据预览：{Path(csv_path).name}（{len(rows)} 行{note}）")
+        self._open_preview(csv_path, columns, rows, truncated)
+
+    def _open_preview(self, csv_path: str, columns: list[str],
+                      rows: list[list[str]], truncated: bool) -> None:
+        """建只读预览窗：Treeview 表格 + 横竖滚动条 + 底部落账标签；
+        每次收获弹一个新 Toplevel 互不替换，数据只读不回写 CSV。"""
+        win = tk.Toplevel(self.root)
+        win.title(f"数据预览：{Path(csv_path).name}")
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=18)
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=110, anchor="w")
+        for row in rows:  # 只读展示：插表后不回写 CSV
+            tree.insert("", "end", values=row)
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        xsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        label = f"已保存：{Path(csv_path).resolve()}（{file_size_str(Path(csv_path))}）"
+        if truncated:
+            label += f"——仅显示前 {self.PREVIEW_ROWS} 行"
+        ttk.Label(win, text=label, anchor="w").pack(
+            fill="x", padx=8, pady=(0, 8))
+
     def _on_close(self) -> None:
         """退出 GUI：子进程还在跑就先 SIGINT（安全收尾，录制不丢）再关窗。
-
         关窗后子进程成为孤儿继续把收尾做完（流程落盘），无人再杀它。
         """
         proc = self.proc

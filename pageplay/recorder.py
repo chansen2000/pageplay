@@ -6,7 +6,8 @@
 不拦截不改变浏览手感）每记一次点击立即经 window.__pageplay_step 回传
 （导航会杀 JS，不能攒着）；按 P（光标不在输入框时）置 picking 标记进
 框选子模式，python 侧调 picker.run_pick 单条模式复用现有 overlay 全套
-（picker.py 一字不动），确认产出收获步（table/download）后清标记回浏览。
+（picker.py 一字不动），确认产出收获步（table/download；卡片组确认把
+list_mode/fields 原样透进步 dict，v0.7 收口）后清标记回浏览。
 点击步落账后 3s 内的导航（framenavigated）把落点 URL 补进 note。
 
 退出语义：关窗 / 空闲 600s 无交互 / Ctrl-C——已收 ≥1 步正常返回全部，
@@ -189,7 +190,10 @@ def _enter_pick(page, steps: list[dict], on_harvest) -> None:
     """P 进框选子模式：picker.run_pick 单条模式（现有契约，picker.py 不动）。
 
     on_harvest 收到与 on_step 同构的流程步骤 dict（kind=table/download，
-    框选 payload 的 action 折进 kind）。Esc/超时 raise PickCancelled：
+    框选 payload 的 action 折进 kind）。卡片组确认（list_mode=cards）把
+    list_mode/fields 原样透进步 dict（runner 靠它们走 extract_cards，
+    缺了重放必坏）；纯表格步不带这两键（向后兼容，v0.7 收口）。
+    Esc/超时 raise PickCancelled：
     页面还活着 → 回浏览模式继续录（不刷新空闲时限，Esc/超时不算进展）；
     页面已关 → 向上抛给主循环按关窗语义收尾。on_harvest 抛异常不吞、
     经 run_pick 向上透传（cli 执行失败要显示）。
@@ -204,6 +208,9 @@ def _enter_pick(page, steps: list[dict], on_harvest) -> None:
             "columns": result.get("columns"),
             "note": "",
         }
+        if result.get("list_mode") == "cards":  # 卡片确认：字段清单透传（重放必需）
+            step["list_mode"] = "cards"
+            step["fields"] = result.get("fields")
         steps.append(step)
         on_harvest(step)
 

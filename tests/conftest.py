@@ -419,3 +419,65 @@ def flow_site():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# v0.7-A：卡片列表假站（picker 卡片识别 / actions extract_cards / runner 用）
+# ---------------------------------------------------------------------------
+
+# 6 张同签名 div 卡片（class="card"，兄弟同级在 .list 容器下），每张含
+# 订单号/标题/价格/状态四个文本节点（嵌套 div/span，非 table）。
+# 首卡标题故意 9 字：验 pickFields 的 label 截前 8 字。
+_CARDS_HTML = """<html><body>
+<h1>订单列表</h1>
+<div class="list">
+  <div class="card"><div class="order-no">TB9001</div><div class="info"><span class="title">无线蓝牙鼠标静音版</span><span class="price">99.0</span><span class="state">已发货</span></div></div>
+  <div class="card"><div class="order-no">TB9002</div><div class="info"><span class="title">机械键盘青轴</span><span class="price">299.0</span><span class="state">已发货</span></div></div>
+  <div class="card"><div class="order-no">TB9003</div><div class="info"><span class="title">USB-C 扩展坞</span><span class="price">159.0</span><span class="state">待发货</span></div></div>
+  <div class="card"><div class="order-no">TB9004</div><div class="info"><span class="title">27 寸显示器</span><span class="price">899.0</span><span class="state">待发货</span></div></div>
+  <div class="card"><div class="order-no">TB9005</div><div class="info"><span class="title">笔记本支架</span><span class="price">79.0</span><span class="state">已签收</span></div></div>
+  <div class="card"><div class="order-no">TB9006</div><div class="info"><span class="title">降噪耳机</span><span class="price">499.0</span><span class="state">已签收</span></div></div>
+</div>
+</body></html>"""
+
+
+class _CardSiteHandler(BaseHTTPRequestHandler):
+    """卡片列表假站：GET /cards → 6 张同签名 div 卡片页（无重复组对照
+    页不另设，复用 table_site 的 /table 或页面里的 h1 等非列表元素）。"""
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/cards"):
+            self._send_html(200, _CARDS_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass  # 静默：不把假站访问日志刷进测试输出
+
+
+@pytest.fixture
+def card_site():
+    """起卡片列表假站（端口 0），yield base_url 字符串，测完关停。
+
+    路由：GET /cards → 6 张同签名 div.card 卡片（订单号/标题/价格/状态
+    四个文本节点，嵌套 div/span，非 table）。风格与 table_site 一致。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CardSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

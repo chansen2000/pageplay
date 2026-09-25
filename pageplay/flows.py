@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 REQUIRED = ("version", "name", "site", "url", "steps")
 VALID_KINDS = ("goto", "click", "table", "download")
+_LIST_MODES = ("table", "cards")  # kind=table 的抓取形态（v0.7-A 卡片列表）
 _LIST_KEYS = ("name", "url", "step_count", "created_at")
 _FLOWS_DIRNAME = "flows"
 
@@ -36,6 +37,8 @@ def save_flow(site_dir: Path, flow: dict) -> Path:
 
     - REQUIRED 任一缺失/为 None/空白串 → ValueError（消息点名缺哪些）
     - steps 必须是非空 list，每个 step 的 kind ∈ VALID_KINDS，否则 ValueError
+    - kind=table 的 step：list_mode ∈ ("table","cards")，缺省 table（旧
+      step 照收）；cards 必须带非空 fields，否则 ValueError
     - 每个 step 自动补 "no"（1 起连续序号，已带的旧值丢弃重排）；
       写入的是副本，不改调用方传入的 flow 底稿
     - 写入自动带 created_at（ISO 秒级）；flow 已带则原样保留
@@ -58,6 +61,17 @@ def save_flow(site_dir: Path, flow: dict) -> Path:
             raise ValueError(
                 f"flow 第 {no} 步的 kind 非法：{kind!r}；"
                 f"只支持 {' / '.join(VALID_KINDS)}")
+        if kind == "table":
+            # v0.7-A 兼容：list_mode 缺省 table（旧 step 照收）；cards 必须带字段
+            list_mode = step.get("list_mode") or "table"
+            if list_mode not in _LIST_MODES:
+                raise ValueError(
+                    f"flow 第 {no} 步的 list_mode 非法：{list_mode!r}；"
+                    f"只支持 {' / '.join(_LIST_MODES)}")
+            if list_mode == "cards" and not step.get("fields"):
+                raise ValueError(
+                    f"flow 第 {no} 步 list_mode=cards 必须带非空 fields"
+                    "（卡片字段清单 [{\"label\", \"rel\"}, ...]）")
 
     path = _flow_path(site_dir, flow["name"])
     payload = dict(flow)

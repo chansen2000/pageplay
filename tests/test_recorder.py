@@ -22,7 +22,7 @@ import pytest
 pytest.importorskip("playwright", reason="未安装 playwright 包")
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-from pageplay import picker, recorder  # noqa: E402
+from pageplay import picker, recorder, runner  # noqa: E402
 from pageplay.picker import PickCancelled  # noqa: E402
 from pageplay.recorder import merge_click_step, record_session  # noqa: E402
 
@@ -359,3 +359,137 @@ def test_record_session_p_ignored_in_input(rec_browser, monkeypatch):
     assert steps[0]["selector"] == "#t"
     assert steps[0]["columns"] is None
     assert steps[0]["note"] == ""
+
+
+# ----------------------------------------------------------------------
+# v0.7 收口：卡片确认接线（list_mode/fields 进收获步）+ 重放端到端
+# ----------------------------------------------------------------------
+
+# 替人：按 P → 等覆层在场 → 锁定卡片组父容器 .list → 确认 payload 带
+# list_mode=cards + 两条 fields → 停手。录制会话由空闲超时收摊（goto 页
+# 脚本关窗无效，见模块 docstring），回浏览态后不再有交互。
+_ARM_CARDS_CONFIRM = """
+() => {
+  const t = setInterval(() => {
+    if (!(window.__pageplay_step && window.__pageplay_picking === false)) return;
+    clearInterval(t);
+    setTimeout(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {key: "p", bubbles: true}));
+      const t2 = setInterval(() => {
+        if (!document.getElementById("__pageplay_overlay")) return;
+        clearInterval(t2);
+        window.__pageplay_locked = document.querySelector(".list");
+        window.__pageplay_onconfirm({
+          selector_hint: ".list", action: "table", columns: null,
+          list_mode: "cards",
+          fields: [
+            {label: "订单号", rel: [{tag: "div", nth: 1}]},
+            {label: "价格", rel: [{tag: "div", nth: 2}, {tag: "span", nth: 2}]},
+          ],
+          rect: {x: 8, y: 40, w: 200, h: 60},
+        });
+      }, 25);
+    }, 300);
+  }, 25);
+}
+"""
+
+# 替人：按 P → 锁定表格 #t → 纯表格确认（payload 无 list_mode/fields）
+# → 等回浏览态 → window.close() 收摊（set_content 页脚本关窗有效）
+_ARM_TABLE_CONFIRM_THEN_CLOSE = """
+() => {
+  const t = setInterval(() => {
+    if (!(window.__pageplay_step && window.__pageplay_picking === false)) return;
+    clearInterval(t);
+    setTimeout(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {key: "p", bubbles: true}));
+      const t2 = setInterval(() => {
+        if (!document.getElementById("__pageplay_overlay")) return;
+        clearInterval(t2);
+        window.__pageplay_locked = document.getElementById("t");
+        window.__pageplay_onconfirm({
+          selector_hint: "#t", action: "table", columns: ["A", "B"],
+          rect: {x: 1, y: 2, w: 3, h: 4},
+        });
+        const t3 = setInterval(() => {
+          if (window.__pageplay_picking) return;  // 等回浏览态
+          clearInterval(t3);
+          window.close();
+        }, 25);
+      }, 25);
+    }, 300);
+  }, 25);
+}
+"""
+
+
+def test_record_cards_harvest_replays_to_csv(rec_browser, card_site,
+                                             monkeypatch, tmp_path):
+    """卡片确认接线端到端：按 P 框选卡片列表确认 → 收获步带 list_mode=cards
+    与 fields 原样 → 该步原样进 flow 由 runner 重放出 CSV（录制-重放
+    闭环，不另写 step；no 重排同 save_flow 落盘行为）。"""
+    monkeypatch.setattr(recorder, "_RECORD_IDLE_TIMEOUT_SEC", _IDLE_TIMEOUT)
+    monkeypatch.setattr(picker, "_PICK_TIMEOUT_SEC", _PICK_TIMEOUT)
+    fields = [
+        {"label": "订单号", "rel": [{"tag": "div", "nth": 1}]},
+        {"label": "价格",
+         "rel": [{"tag": "div", "nth": 2}, {"tag": "span", "nth": 2}]},
+    ]
+    pg = rec_browser.new_page()
+    try:
+        pg.goto(card_site + "/cards")
+        pg.evaluate(_ARM_CARDS_CONFIRM)
+        steps = record_session(pg, lambda _s: None, lambda _s: None)
+    finally:
+        pg.close()
+
+    assert [s["kind"] for s in steps] == ["table"]
+    harvest = steps[0]
+    assert harvest["list_mode"] == "cards"  # 新键：卡片模式进录制 flow
+    assert harvest["fields"] == fields      # 原样透传，runner 靠它取字段
+    assert harvest["columns"] is None
+    # selector 由 COLLECT_CHAIN_JS 现算：锁定 .list → html > body > div.list
+    assert harvest["selector"] == "html > body > div.list"
+
+    # 重放：收获步原样进 flow → run_flow 抓卡片出 CSV
+    rec_browser.new_context()  # run_flow 取 contexts[0] 开页，须先有上下文
+    flow = {
+        "version": 1, "name": "rec-cards", "site": "cards",
+        "url": card_site + "/cards",
+        "steps": [
+            {"no": 1, "kind": "goto", "url": card_site + "/cards"},
+            dict(harvest, no=2),
+        ],
+    }
+    result = runner.run_flow(rec_browser, flow, tmp_path)
+
+    assert result["ok"] is True and result["failed_step"] is None
+    assert "抓卡片 6 行" in result["results"][1]["detail"]
+    csv_text = (tmp_path / "rec-cards-2.csv").read_bytes().decode("utf-8-sig")
+    lines = csv_text.splitlines()
+    assert lines[0] == "订单号,价格"
+    assert lines[1] == "TB9001,99.0"
+    assert len(lines) == 7  # 表头 + 6 卡
+
+
+def test_record_table_harvest_step_has_no_cards_keys(rec_browser, monkeypatch):
+    """纯表格收获：step 不带 list_mode/fields 新键（向后兼容契约）。"""
+    monkeypatch.setattr(recorder, "_RECORD_IDLE_TIMEOUT_SEC", 10)
+    monkeypatch.setattr(picker, "_PICK_TIMEOUT_SEC", _PICK_TIMEOUT)
+    pg = rec_browser.new_page()
+    try:
+        pg.set_content("""<html><body>
+        <table id="t"><thead><tr><th>A</th><th>B</th></tr></thead>
+        <tbody><tr><td>1</td><td>2</td></tr></tbody></table>
+        </body></html>""")
+        pg.evaluate(_ARM_TABLE_CONFIRM_THEN_CLOSE)
+        steps = record_session(pg, lambda _s: None, lambda _s: None)
+    finally:
+        pg.close()
+
+    assert len(steps) == 1
+    assert steps[0]["kind"] == "table"
+    assert steps[0]["columns"] == ["A", "B"]
+    assert set(steps[0]) == {"no", "kind", "url", "selector", "columns", "note"}

@@ -1,8 +1,9 @@
-"""run 执行器：页面风控检查、表格提取、结果落盘、文件下载。
+"""run 执行器：页面风控检查、表格/卡片提取、结果落盘、文件下载。
 
 供 run 流程按任务书驱动：每拿到一页响应先过 check_page_risk，再按
-选择器抽表、抽完即落盘，需要导出文件时走 download_element。本模块
-不持有会话状态——context 由调用方（session/run 层）提供。
+选择器抽表（语义表格）或抽卡片（div 卡片列表）、抽完即落盘，需要导出
+文件时走 download_element。本模块不持有会话状态——context 由调用方
+（session/run 层）提供。
 """
 
 from __future__ import annotations
@@ -44,6 +45,41 @@ _TABLE_JS = """
 """
 
 
+# 页面上下文执行的读卡片脚本：容器内按同签名(tag+首class)兄弟重算最大组
+# （≥3 条）为记录，逐条按各 field.rel（[{tag,nth}] 相对链，item 端在首）
+# 解析到文本宿主元素取 trim 文本。返回 [{label: 值}, ...]；无组返回 []。
+_CARDS_JS = """
+(el, fields) => {
+  let best = null;
+  for (const c of el.children) {
+    const g = Array.prototype.filter.call(el.children, s =>
+      s.tagName === c.tagName && s.classList[0] === c.classList[0]
+      && (s.textContent || "").trim());
+    if (g.length >= 3 && (!best || g.length > best.length)) best = g;
+  }
+  if (!best) return [];
+  return best.map(item => {
+    const row = {};
+    for (const f of fields) {
+      let n = item;
+      for (const step of (f.rel || [])) {
+        let k = 0, found = null;
+        for (const ch of n.children) {
+          if (ch.tagName.toLowerCase() === step.tag && ++k === step.nth) {
+            found = ch; break;
+          }
+        }
+        n = found;
+        if (!n) break;
+      }
+      row[f.label] = n ? (n.textContent || "").trim() : "";
+    }
+    return row;
+  });
+}
+"""
+
+
 def check_page_risk(text: str) -> None:
     """复用 guard 的风控关键词扫描：命中即 raise RiskTriggered。
 
@@ -78,6 +114,33 @@ def extract_table(page, selector: str, columns: list[str] | None) -> list[dict]:
             entry[name] = row[i] if i < len(row) else ""
         rows.append(entry)
     logger.debug("extract_table %s: %d 行 x %d 列", selector, len(rows), len(headers))
+    return rows
+
+
+def extract_cards(page, list_selector: str, fields: list[dict]) -> list[dict]:
+    """在页面上下文读 selector 指向的卡片列表，返回 [{"字段": "值"}, ...]。
+
+    卡片列表 = div 等容器内一组同签名（同标签且首个 class 相同）兄弟
+    记录（≥3 条），典型如淘宝订单列表——非语义表格，extract_table 读
+    不到。fields 来自框选确认 payload（每项 {"label", "rel"}，rel 是
+    记录内定位文本宿主的 [{tag,nth}] 相对链）；键用 label（框选时取
+    文本前 8 字）。记录内某字段定位落空 → 该格填 ""（对齐 extract_table
+    缺列补空语义）。
+
+    fields 为空 → ValueError（至少勾选一个字段）；容器内识别不到同
+    签名记录组 → ValueError 人话（回页面重新框选）。
+    """
+    if not fields:
+        raise ValueError(
+            "fields 为空：卡片抓取至少要勾选一个字段"
+            "（fields=[{\"label\", \"rel\"}, ...]，来自框选确认 payload）")
+    rows = page.eval_on_selector(list_selector, _CARDS_JS, fields)
+    if not rows:
+        raise ValueError(
+            f"选择器 {list_selector!r} 下未识别到卡片列表：容器内需要"
+            " ≥3 条同结构记录（同标签且首个 class 相同），请回页面重新框选")
+    logger.debug("extract_cards %s: %d 行 x %d 字段",
+                 list_selector, len(rows), len(fields))
     return rows
 
 

@@ -14,6 +14,7 @@ import pytest
 from pageplay.actions import (
     check_page_risk,
     download_element,
+    extract_cards,
     extract_table,
     file_size_str,
     save_table,
@@ -158,3 +159,38 @@ def test_download_element_saves_file(real_page, table_site, tmp_path):
     target = download_element(real_page, "#dl", tmp_path / "dl")
     assert target == tmp_path / "dl" / "report.xlsx"
     assert target.read_bytes() == b"fake-xlsx-content"
+
+
+# ---------------------------------------------------------------------------
+# extract_cards（真 chromium + card_site，v0.7-A 卡片列表）
+# ---------------------------------------------------------------------------
+
+# 与 conftest _CARDS_HTML 结构逐字对应：订单号 = 卡片第 1 个 div；
+# 价格 = 第 2 个 div 里的第 2 个 span
+_CARDS_FIELDS = [
+    {"label": "订单号", "rel": [{"tag": "div", "nth": 1}]},
+    {"label": "价格", "rel": [{"tag": "div", "nth": 2}, {"tag": "span", "nth": 2}]},
+]
+
+
+def test_extract_cards_two_fields(real_page, card_site):
+    """6 张卡片 × 勾选 2 字段：6 行 dict，rel 相对链逐条解析命中。"""
+    real_page.goto(f"{card_site}/cards")
+    rows = extract_cards(real_page, "div.list", _CARDS_FIELDS)
+    assert len(rows) == 6
+    assert rows[0] == {"订单号": "TB9001", "价格": "99.0"}
+    assert rows[5] == {"订单号": "TB9006", "价格": "499.0"}
+
+
+def test_extract_cards_empty_fields_raises(real_page, card_site):
+    """fields 为空 → ValueError（至少勾选一个字段）。"""
+    real_page.goto(f"{card_site}/cards")
+    with pytest.raises(ValueError, match="fields"):
+        extract_cards(real_page, "div.list", [])
+
+
+def test_extract_cards_no_card_group_raises(real_page, card_site):
+    """容器内无同签名记录组（h1 无子元素）→ ValueError 人话带重新框选指引。"""
+    real_page.goto(f"{card_site}/cards")
+    with pytest.raises(ValueError, match="重新框选"):
+        extract_cards(real_page, "h1", _CARDS_FIELDS)
