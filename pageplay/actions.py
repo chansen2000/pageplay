@@ -17,6 +17,10 @@ from .guard import Guard
 
 logger = logging.getLogger(__name__)
 
+# 0 行失败的稳定锚点（T20）：extract_table 空结果 raise 的消息前缀，
+# cli_pick 据此把"锁错目标"与会话退出码 1 关联，不靠文案巧合。
+ZERO_ROWS_PREFIX = "提取到 0 行"
+
 # 页面上下文执行的读表脚本：返回 {headers, data}，值为 trim 后的文本。
 # 列名取 thead 首行；无 thead 时取首行，其余行作数据。
 _TABLE_JS = """
@@ -95,7 +99,14 @@ def extract_table(page, selector: str, columns: list[str] | None) -> list[dict]:
     第一行（thead 首行，无 thead 则表体首行）作列名，其余行作数据；
     单元格取文本并去除首尾空白。columns 给定时只保留这些列（顺序按
     columns），出现表中不存在的列名 → ValueError 点名缺的列。
+
+    T20 防呆（消灭"抓表 0 行"误报）：columns 为空列表 → ValueError
+    （一列没勾，抓不出东西）；目标里没有可读数据行（锁定容器无 tr /
+    只有表头行）→ ValueError 人话（真机教训：0 行照报 ✓ 已生成，
+    用户拿着空产物以为成功）。
     """
+    if columns is not None and not columns:
+        raise ValueError("没有勾选任何列：至少勾选一列才能抓表")
     raw = page.eval_on_selector(selector, _TABLE_JS)
     headers: list[str] = list(raw["headers"])
     data: list[list[str]] = raw["data"]
@@ -113,6 +124,10 @@ def extract_table(page, selector: str, columns: list[str] | None) -> list[dict]:
         for i, name in enumerate(headers):
             entry[name] = row[i] if i < len(row) else ""
         rows.append(entry)
+    if not rows or not rows[0]:  # 无数据行 / 无列名：按失败处理，不产空产物
+        raise ValueError(
+            f"{ZERO_ROWS_PREFIX}：锁定的目标里没有可读数据。"
+            "看到「识别到 N 条记录」的面板再确认")
     logger.debug("extract_table %s: %d 行 x %d 列", selector, len(rows), len(headers))
     return rows
 

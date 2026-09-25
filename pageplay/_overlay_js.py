@@ -15,12 +15,15 @@ OVERLAY_JS = """
 (() => {
   if (window.__pageplay_cleanup) { try { window.__pageplay_cleanup(); } catch (e) {} }
 
-  const SEM = "table,ul,ol,[role=grid]";
+  // T20 语义收窄：只认 table/[role=grid]。ul/ol 不再被语义优先劫持——
+  // 语义容器锁中没有 tr 的列表 → extract_table 必然 0 行（真机两次踩坑）；
+  // ul 里的 li 卡片组改由 cardGroup 正常认领，走字段勾选路径（更有用）
+  const SEM = "table,[role=grid]";
   const HB_MS = 800;  // 自愈心跳周期：覆层被剥后最迟一个周期重新布防
   let current = null, curGroup = null;  // 高亮目标 / 其卡片组（null=非卡片模式）
   let locked = null;    // 点击锁定后的目标
   const upStack = [];   // ↑ 扩选记录（↓ 收回用）
-  let overlay = null, box = null, panel = null;
+  let overlay = null, box = null, panel = null, lab = null;
   let ac = null;        // 文档监听生命周期（abort = 监听已拆）
   let hbTimer = 0;
   let over = false;     // 会话结束（确认/取消/清理）：不再布防
@@ -39,6 +42,30 @@ OVERLAY_JS = """
     box.style.width = r.w + "px";
     box.style.height = r.h + "px";
     box.style.display = "block";
+  }
+  function labelFor(el) {  // T20 红框标签：点击前就看清锁中的目标类型
+    if (curGroup && el === curGroup.box) {
+      // T21c：hover 阶段就按闸2 同口径判质量（pickFields 已含闸1 过滤，
+      // 单 item TreeWalker 微秒级，mousemove 高频可接受、不缓存）——
+      // 字段<2 的垃圾组不冒充"卡片列表"（真机淘宝首页：hover 报
+      // "卡片列表：4 条记录"，点击却被闸2 拦，标签误导）
+      if (pickFields(curGroup.items[0]).length < 2)
+        return "区域：未识别到列表结构";
+      return "卡片列表：" + curGroup.items.length + " 条记录";
+    }
+    try {
+      if (el && el.matches && el.matches("table,[role=grid]"))
+        return "表格：" + el.querySelectorAll("tr").length + " 行";
+    } catch (e) {}
+    return "元素（无表格结构，仅可下载）";
+  }
+  function showBox(el) {  // 红框 + 类型标签一起走（标签挂 box 左上角上方）
+    moveBox(el);
+    const r = rectOf(el);
+    lab.textContent = labelFor(el);
+    lab.style.left = r.x + "px";
+    lab.style.top = Math.max(0, r.y - 22) + "px";
+    lab.style.display = "block";
   }
   function tagNth(n) {
     let k = 1, s = n;
@@ -98,9 +125,13 @@ OVERLAY_JS = """
     const out = [], w = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
     let last = null, m;
     while ((m = w.nextNode())) {
+      const host = m.parentElement;
+      // T21b 闸1（文本质量）：SCRIPT/STYLE/NOSCRIPT 里的文本是代码不是数据
+      // （真机淘宝首页 CSS 充字段的误报根源）→ 不进候选、不参与去重状态
+      if (host && /^(SCRIPT|STYLE|NOSCRIPT)$/.test(host.tagName)) continue;
       const t = (m.textContent || "").trim();
-      if (t.length < 2 || (last && (t === last.t || m.parentElement === last.el))) continue;
-      last = {t: t, el: m.parentElement};
+      if (t.length < 2 || (last && (t === last.t || host === last.el))) continue;
+      last = {t: t, el: host};
       out.push({label: t.slice(0, 8) || "字段" + (out.length + 1), rel: relFrom(item, m)});
     }
     return out;
@@ -117,13 +148,20 @@ OVERLAY_JS = """
       + "background:#fff;border:1px solid #ccc;border-radius:6px;padding:10px 12px;"
       + "font:13px/1.6 -apple-system,sans-serif;color:#222;"
       + "box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:70vh;overflow:auto;";
+    lab = document.createElement("div");
+    lab.id = "__pageplay_boxlabel";
+    lab.style.cssText = "position:fixed;display:none;pointer-events:none;z-index:2147483647;"
+      + "background:#fff;border:1px solid #ccc;border-radius:4px;padding:2px 8px;"
+      + "font:12px/1.6 -apple-system,sans-serif;color:#222;white-space:nowrap;"
+      + "box-shadow:0 2px 8px rgba(0,0,0,.12);";
     overlay.appendChild(box);
     overlay.appendChild(panel);
+    overlay.appendChild(lab);
     (document.body || document.documentElement).appendChild(overlay);
   }
-  function alive() {  // 覆层三件套仍全部挂在文档里
-    return !!(overlay && box && panel && overlay.isConnected
-      && box.isConnected && panel.isConnected);
+  function alive() {  // 覆层四件套仍全部挂在文档里
+    return !!(overlay && box && panel && lab && overlay.isConnected
+      && box.isConnected && panel.isConnected && lab.isConnected);
   }
   function confirmPick(action, columns, listMode, fields) {
     if (!locked) return;
@@ -166,7 +204,7 @@ OVERLAY_JS = """
       if (g) { curGroup = g; current = g.box; }
       else current = sem;                 // ③ 兜底：元素自身
     }
-    if (current) moveBox(current);
+    if (current) showBox(current);
   }
   function onClick(e) {
     if (locked) return;  // 已锁定：后续点击还给页面/面板
@@ -174,7 +212,7 @@ OVERLAY_JS = """
     e.preventDefault();
     e.stopPropagation();
     locked = current || semantic(e.target);
-    moveBox(locked);
+    showBox(locked);  // 锁定后标签保留（T20：锁定态类型仍可见）
     if (locked.matches("table,[role=grid]")) renderColumnBar(locked);
     else if (curGroup && locked === curGroup.box) renderFieldBar(curGroup);
     else renderActionPanel();
@@ -185,10 +223,10 @@ OVERLAY_JS = """
     if (e.key === "ArrowUp") {
       const p = current && current.parentElement;
       if (p) { upStack.push(current); current = p; curGroup = null;
-               moveBox(p); e.preventDefault(); }
+               showBox(p); e.preventDefault(); }
     } else if (e.key === "ArrowDown") {
       if (upStack.length) { current = upStack.pop(); curGroup = null;
-                            moveBox(current); e.preventDefault(); }
+                            showBox(current); e.preventDefault(); }
     }
   }
   function btn(label) {
@@ -219,33 +257,59 @@ OVERLAY_JS = """
     title.textContent = "已锁定表格，选择要抓取的列：";
     panel.appendChild(title);
     const cols = readHeaders(t);
-    const boxes = checkList(cols);
     const ok = btn("确认");
-    ok.onclick = () => confirmPick("table", cols.filter((c, i) => boxes[i].checked));
+    if (!cols.length) {  // T20 防呆：无表格行 → 读不到列，确认置灰拦住
+      const warn = document.createElement("div");
+      warn.textContent = "该目标读不到列（无表格行），按 Esc 换目标";
+      warn.style.cssText = "color:#e5484d;";
+      panel.appendChild(warn);
+      ok.disabled = true;
+      ok.style.opacity = "0.5";
+    } else {
+      const boxes = checkList(cols);
+      ok.onclick = () => confirmPick("table", cols.filter((c, i) => boxes[i].checked));
+    }
     panel.appendChild(ok);
     panel.style.display = "block";
   }
   function renderFieldBar(g) {  // 卡片组锁定：识别到 N 条记录 + 字段勾选（确认=抓卡片）
     panel.textContent = "";
-    const title = document.createElement("div");
-    title.textContent = "识别到 " + g.items.length + " 条记录，选择要抓取的字段：";
-    panel.appendChild(title);
     const fields = pickFields(g.items[0]);
-    const boxes = checkList(fields.map(f => f.label));
-    const ok = btn("确认");
-    ok.onclick = () => confirmPick("table", null, "cards",
-      fields.filter((f, i) => boxes[i].checked));
-    panel.appendChild(ok);
+    if (fields.length < 2) {  // T21b 闸2（结构门槛）：有效字段<2=垃圾组（同签名
+      const note = document.createElement("div");  // 兄弟但无重复数据结构），不给
+      note.textContent = "未识别到有效的重复数据结构";  // 勾选/确认入口，同"无表格结构"
+      note.style.cssText = "color:#888;font-size:12px;";
+      panel.appendChild(note);
+      const dl = btn("下载此元素");
+      dl.onclick = () => confirmPick("download", null);
+      panel.appendChild(dl);
+    } else {
+      const title = document.createElement("div");
+      title.textContent = "识别到 " + g.items.length + " 条记录，选择要抓取的字段：";
+      panel.appendChild(title);
+      const boxes = checkList(fields.map(f => f.label));
+      const ok = btn("确认");
+      ok.onclick = () => confirmPick("table", null, "cards",
+        fields.filter((f, i) => boxes[i].checked));
+      panel.appendChild(ok);
+    }
     panel.style.display = "block";
   }
   function renderActionPanel() {
     panel.textContent = "";
     const dl = btn("下载此元素");
     dl.onclick = () => confirmPick("download", null);
-    const tb = btn("抓取此表");
-    tb.onclick = () => confirmPick("table", null);
     panel.appendChild(dl);
-    panel.appendChild(tb);
+    if (locked.querySelectorAll("tr").length) {  // 有表格行才提供抓表
+      const tb = btn("抓取此表");
+      tb.onclick = () => confirmPick("table", null);
+      panel.appendChild(tb);
+    } else {  // T20 防呆：无 tr 抓表必 0 行，明说不可抓，不给假入口
+      const note = document.createElement("div");
+      note.textContent = "该元素无表格结构，不可抓表";
+      note.style.cssText = "color:#888;font-size:12px;";
+      panel.appendChild(note);
+    }
     panel.style.display = "block";
   }
   function arm() {  // 文档级监听（AbortController 一把拆），已布防则跳过

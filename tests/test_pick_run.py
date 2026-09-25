@@ -247,6 +247,107 @@ def test_pick_cancelled_returns_one(home_dir, monkeypatch, capsys):
 
 
 # ----------------------------------------------------------------------
+# T20：提取 0 行 = 失败（不再 ✓ 已生成），会话继续、退出码 1
+# ----------------------------------------------------------------------
+
+_ZERO_TABLE = {"headers": ["名称"], "data": []}
+
+
+def test_pick_zero_rows_fails_exit_one(home_dir, table_site, tmp_path,
+                                       monkeypatch, capsys):
+    """确认后提取 0 行：✗ 人话 + fail 账 + 无产物 + 退出码 1（不再 ✓）。"""
+    _write_saved_site(home_dir, name="faketest")
+    fake_home = fake_downloads_home(monkeypatch, tmp_path)
+    page = PickPage(table_site + "/table", table=_ZERO_TABLE)
+    install_browser(monkeypatch, page)
+
+    def fake_run_pick(page, on_confirm, repeat=False):
+        payload = {"selector": "#data", "action": "table",
+                   "columns": ["名称"], "rect": {"x": 1}}
+        on_confirm(payload)
+        return [payload]
+
+    monkeypatch.setattr("pageplay.picker.run_pick", fake_run_pick)
+
+    assert main(["pick", "faketest", "--name", "zr"]) == 1
+
+    captured = capsys.readouterr()
+    assert "提取到 0 行" in captured.err and "✗" in captured.err
+    assert "✓" not in captured.out            # 不再报"已生成"
+    assert "共收 1 条" in captured.out         # 会话照常走完摘要
+    (entry,) = load_runs(_runs_path())
+    assert entry["status"] == "fail" and entry["outputs"] == []
+    assert "提取到 0 行" in entry["detail"]
+    assert not list((fake_home / "Downloads" / "pageplay" / "zr").glob("*.csv"))
+    recipe = json.loads((home_dir / "sites" / "faketest" / "recipes"
+                         / "zr.json").read_text(encoding="utf-8"))
+    assert recipe["action"] == "table"        # recipe 照存（失败在执行不在保存）
+
+
+def test_pick_zero_rows_session_continues_exit_one(
+        home_dir, table_site, tmp_path, monkeypatch, capsys):
+    """0 行不中断会话：第 1 条失败第 2 条成功照落；会话结束退出码仍 1。"""
+    _write_saved_site(home_dir, name="faketest")
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = PickPage(table_site + "/table", table={
+        "headers": ["名称"], "data": [["商品1"]]})
+    install_browser(monkeypatch, page)
+
+    def fake_run_pick(page, on_confirm, repeat=False):
+        ok = {"selector": "#data", "action": "table",
+              "columns": ["名称"], "rect": {"x": 1}}
+        on_confirm(ok)
+        page.table = _ZERO_TABLE  # 第 2 条锁到没有数据的容器
+        on_confirm(ok)
+        return [ok, ok]
+
+    monkeypatch.setattr("pageplay.picker.run_pick", fake_run_pick)
+    monkeypatch.setattr("pageplay.picker.cover_screenshot",
+                        lambda page, selector, out: out.write_bytes(b"png"))
+
+    assert main(["pick", "faketest", "--name", "mix"]) == 1  # 出现过 0 行
+
+    entries = load_runs(_runs_path())
+    assert len(entries) == 2
+    assert {e["status"] for e in entries} == {"ok", "fail"}  # 成功条照常 ok
+
+
+def test_pick_cards_confirm_extracts_cards_and_saves_recipe(
+        home_dir, table_site, tmp_path, monkeypatch, capsys):
+    """卡片确认（list_mode=cards + fields）当场走 extract_cards 出数据；
+    recipe 落盘带 list_mode/fields（run 重放分派靠它们）。"""
+    _write_saved_site(home_dir, name="faketest")
+    fake_home = fake_downloads_home(monkeypatch, tmp_path)
+    page = PickPage(table_site + "/table", cards=[
+        {"订单号": f"TB900{i}"} for i in range(1, 7)])
+    install_browser(monkeypatch, page)
+    fields = [{"label": "订单号", "rel": [{"tag": "div", "nth": 1}]}]
+
+    def fake_run_pick(page, on_confirm, repeat=False):
+        payload = {"selector": "div.list", "action": "table",
+                   "columns": None, "list_mode": "cards",
+                   "fields": fields, "rect": {"x": 1}}
+        on_confirm(payload)
+        return [payload]
+
+    monkeypatch.setattr("pageplay.picker.run_pick", fake_run_pick)
+    monkeypatch.setattr("pageplay.picker.cover_screenshot",
+                        lambda page, selector, out: out.write_bytes(b"png"))
+
+    assert main(["pick", "faketest", "--name", "cards-x"]) == 0
+
+    products = fake_home / "Downloads" / "pageplay" / "cards-x"
+    (csv_path,) = products.glob("cards-x-*.csv")
+    lines = csv_path.read_bytes().decode("utf-8-sig").splitlines()
+    assert lines[0] == "订单号" and len(lines) == 7  # 表头 + 6 行卡片
+    recipe = json.loads((home_dir / "sites" / "faketest" / "recipes"
+                         / "cards-x.json").read_text(encoding="utf-8"))
+    assert recipe["list_mode"] == "cards" and recipe["fields"] == fields
+    (entry,) = load_runs(_runs_path())
+    assert entry["status"] == "ok" and "6 行" in entry["detail"]
+
+
+# ----------------------------------------------------------------------
 # results：执行账本回看
 # ----------------------------------------------------------------------
 

@@ -129,6 +129,41 @@ def test_record_no_steps_and_cancelled_exit_one(home_dir, tmp_path,
     assert main(["record", "faketest"]) == 1
     assert "未记录任何操作" in capsys.readouterr().out
 
+
+def test_record_zero_row_harvest_fails_and_session_continues(
+        home_dir, tmp_path, monkeypatch, capsys):
+    """T20：收获步 0 行 → ✗ + fail 账，录制会话不中断，下一条照收、流程照存。"""
+    _write_saved_site(home_dir)
+    fake_downloads_home(monkeypatch, tmp_path)
+    page = RecordPage(_START, table={"headers": ["名称"], "data": []})
+    install_browser(monkeypatch, page)
+
+    def fake_record_session(p, on_step, on_harvest):
+        on_harvest({"no": 1, "kind": "table", "url": _START,
+                    "selector": "#t1", "columns": ["名称"], "note": ""})
+        p.table = {"headers": ["名称"], "data": [["商品1"]]}  # 下一条有数据
+        on_harvest({"no": 2, "kind": "table", "url": _START,
+                    "selector": "#t2", "columns": ["名称"], "note": ""})
+        return [{"no": 1, "kind": "table", "url": _START,
+                 "selector": "#t1", "columns": ["名称"], "note": ""},
+                {"no": 2, "kind": "table", "url": _START,
+                 "selector": "#t2", "columns": ["名称"], "note": ""}]
+
+    monkeypatch.setattr("pageplay.recorder.record_session",
+                        fake_record_session)
+    monkeypatch.setattr("builtins.input", lambda *a: "zr-flow")
+
+    assert main(["record", "faketest"]) == 0  # 会话不中断，流程照常保存
+
+    flow = load_flow(home_dir / "sites" / "faketest", "zr-flow")
+    assert [s["no"] for s in flow["steps"]] == [1, 2]  # 两条收获步都在
+    entries = load_runs(_runs_path())
+    assert sorted(e["status"] for e in entries) == ["fail", "ok"]
+    assert any("提取到 0 行" in e["detail"] for e in entries)
+    captured = capsys.readouterr()
+    assert "提取到 0 行" in captured.err
+    assert "流程已保存：zr-flow" in captured.out
+
     def cancelled(p, s, h):
         raise PickCancelled("人 Ctrl-C 结束了录制")
 

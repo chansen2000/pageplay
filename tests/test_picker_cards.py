@@ -146,6 +146,142 @@ def test_hover_prefers_semantic_table_over_card_group(pick_page, table_site):
 
 
 # ----------------------------------------------------------------------
+# T21b 误报收紧：文本全是 style/script 的垃圾组 → 两道闸拦下
+# ----------------------------------------------------------------------
+
+# 真机淘宝首页缺陷形态：3 个同签名兄弟，"文本"实为 <style> 里的 CSS
+# （.feedsCa.skeleton…）——textContent 充数成卡片文本，旧逻辑给出巨区
+# 红框 + "识别到 3 条记录" + 垃圾字段勾选条。
+_TRASH_HTML = """<html><body>
+<h1>搜索框区域</h1>
+<div class="feeds-wrap">
+  <div class="feedsCa"><style>.feedsCa.skeleton{width:100px;height:80px}</style></div>
+  <div class="feedsCa"><style>.feedsCa.item{background:#f4f4f4;margin:8px}</style></div>
+  <div class="feedsCa"><style>.feedsCa.end{display:none;opacity:0}</style></div>
+</div>
+</body></html>"""
+
+# 替人框垃圾组首项：锁定组父容器 → 记面板文案/勾选数/有无确认与下载按钮
+# → 点"下载此元素"（闸2 下唯一出口），确认 payload 走 download 通道。
+_ARM_TRASH_GROUP = """
+() => {
+  const timer = setInterval(() => {
+    if (!window.__pageplay_onconfirm
+        || !document.getElementById("__pageplay_overlay")) return;
+    clearInterval(timer);
+    const item = document.querySelector(".feedsCa");
+    item.dispatchEvent(new MouseEvent("mousemove", {bubbles: true}));
+    item.dispatchEvent(new MouseEvent("click", {bubbles: true}));
+    const panel = document.getElementById("__pageplay_overlay").children[1];
+    window.__pp_panel_text = panel.textContent;
+    window.__pp_field_count = panel.querySelectorAll("input[type=checkbox]").length;
+    window.__pp_has_ok = Array.prototype.some.call(
+      panel.querySelectorAll("button"), b => b.textContent === "确认");
+    const dl = Array.prototype.find.call(
+      panel.querySelectorAll("button"), b => b.textContent === "下载此元素");
+    window.__pp_has_dl = !!dl;
+    if (dl) dl.click();
+  }, 25);
+}
+"""
+
+
+def test_trash_style_only_group_gated_to_download(pick_page):
+    """T21b 两道闸：同签名兄弟的文本宿主全是 <style>（CSS 充数）→ 闸1
+    过滤后字段 <2 → 闸2 不渲染勾选条：灰字"未识别到有效的重复数据结构"
+    + 只留"下载此元素"（无勾选框/无确认，垃圾组没有可确认的字段路径）；
+    确认出 action=download、fields=null（list_mode 走缺省 table 非 cards）。"""
+    pick_page.set_content(_TRASH_HTML)
+    pick_page.evaluate(_ARM_TRASH_GROUP)
+    result = run_pick(pick_page, lambda _r: None)
+
+    panel_text = pick_page.evaluate("() => window.__pp_panel_text")
+    assert "未识别到有效的重复数据结构" in panel_text
+    assert "识别到 3 条记录" not in panel_text  # 勾选条标题不出现（含字段选择入口）
+    assert pick_page.evaluate("() => window.__pp_field_count") == 0
+    assert pick_page.evaluate("() => window.__pp_has_ok") is False
+    assert pick_page.evaluate("() => window.__pp_has_dl") is True
+    assert result["action"] == "download"
+    assert result["list_mode"] == "table"
+    assert result["fields"] is None
+
+
+# ----------------------------------------------------------------------
+# T21c hover 标签不误导：垃圾组 hover 不冒充"卡片列表"，好组照旧
+# ----------------------------------------------------------------------
+
+# 替人 hover 垃圾组首项：只 mousemove 记 hover 红框标签 → 再点击锁定记
+# 锁定态标签 → 闸2 下唯一出口"下载此元素"收场（run_pick 需一次确认才返回）。
+_ARM_TRASH_HOVER = """
+() => {
+  const timer = setInterval(() => {
+    if (!window.__pageplay_onconfirm
+        || !document.getElementById("__pageplay_overlay")) return;
+    clearInterval(timer);
+    const item = document.querySelector(".feedsCa");
+    item.dispatchEvent(new MouseEvent("mousemove", {bubbles: true}));
+    window.__pp_hover_label =
+      document.getElementById("__pageplay_boxlabel").textContent;
+    item.dispatchEvent(new MouseEvent("click", {bubbles: true}));
+    window.__pp_lock_label =
+      document.getElementById("__pageplay_boxlabel").textContent;
+    const dl = Array.prototype.find.call(
+      document.getElementById("__pageplay_overlay").children[1]
+        .querySelectorAll("button"), b => b.textContent === "下载此元素");
+    dl.click();
+  }, 25);
+}
+"""
+
+# 替人 hover 正常卡片组首卡叶子：记 hover 标签 → 点击锁定 → 字段全勾确认
+# 收场（质量判定前移后，好组文案必须原样保留）。
+_ARM_CARDS_HOVER = """
+() => {
+  const timer = setInterval(() => {
+    if (!window.__pageplay_onconfirm
+        || !document.getElementById("__pageplay_overlay")) return;
+    clearInterval(timer);
+    const span = document.querySelector(".card .title");
+    span.dispatchEvent(new MouseEvent("mousemove", {bubbles: true}));
+    window.__pp_hover_label =
+      document.getElementById("__pageplay_boxlabel").textContent;
+    span.dispatchEvent(new MouseEvent("click", {bubbles: true}));
+    const ok = Array.prototype.find.call(
+      document.getElementById("__pageplay_overlay").children[1]
+        .querySelectorAll("button"), b => b.textContent === "确认");
+    ok.click();
+  }, 25);
+}
+"""
+
+
+def test_trash_group_hover_label_not_card_list(pick_page):
+    """T21c：垃圾组（文本全是 <style> CSS）hover 标签=「区域：未识别到
+    列表结构」，不含"卡片列表"字样，锁定态标签与之一致——hover 阶段就
+    按闸2 同口径判质量，不再出现"hover 报卡片列表、点击却未识别到结构"
+    的误导（真机淘宝首页搜索框区缺陷）。"""
+    pick_page.set_content(_TRASH_HTML)
+    pick_page.evaluate(_ARM_TRASH_HOVER)
+    run_pick(pick_page, lambda _r: None)
+
+    hover = pick_page.evaluate("() => window.__pp_hover_label")
+    assert "未识别到列表结构" in hover
+    assert "卡片列表" not in hover
+    assert pick_page.evaluate("() => window.__pp_lock_label") == hover
+
+
+def test_card_group_hover_label_still_card_list(pick_page, card_site):
+    """正常卡片组 hover 标签照旧「卡片列表：6 条记录」——质量判定前移
+    不改好组既有文案（质量闸只拦字段<2 的垃圾组）。"""
+    pick_page.goto(f"{card_site}/cards")
+    pick_page.evaluate(_ARM_CARDS_HOVER)
+    run_pick(pick_page, lambda _r: None)
+
+    assert pick_page.evaluate(
+        "() => window.__pp_hover_label") == "卡片列表：6 条记录"
+
+
+# ----------------------------------------------------------------------
 # runner 集成：手写 flow step（list_mode=cards + fields）→ CSV 6 行 2 列
 # ----------------------------------------------------------------------
 

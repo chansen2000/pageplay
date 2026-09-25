@@ -84,10 +84,12 @@ def _cmd_grab(args: argparse.Namespace) -> int:
 
     def _handler(result: dict) -> None:
         # 执行 + 落账，不存 recipe；账本 action 记 grab。RiskTriggered
-        # 从 _execute_and_record 穿透（run_pick 透传回调异常）→ 退出码 2
-        products = _execute_and_record(
+        # 从 _execute_and_record 穿透（run_pick 透传回调异常）→ 退出码 2；
+        # list_mode/fields 原样透传（卡片确认当场走 extract_cards，T20）
+        products, _detail = _execute_and_record(
             page, name, str(result["action"]), str(result["selector"]),
-            result.get("columns"), out_dir, ledger_action="grab")
+            result.get("columns"), out_dir, ledger_action="grab",
+            list_mode=result.get("list_mode"), fields=result.get("fields"))
         picked["ok"] = products is not None
 
     try:

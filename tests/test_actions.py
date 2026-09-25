@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from pageplay.actions import (
+    ZERO_ROWS_PREFIX,
     check_page_risk,
     download_element,
     extract_cards,
@@ -194,3 +195,30 @@ def test_extract_cards_no_card_group_raises(real_page, card_site):
     real_page.goto(f"{card_site}/cards")
     with pytest.raises(ValueError, match="重新框选"):
         extract_cards(real_page, "h1", _CARDS_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# extract_table 空结果防呆（T20：0 行 = 失败，不再报 ✓ 已生成）
+# ---------------------------------------------------------------------------
+
+def test_extract_table_no_table_rows_raises(real_page):
+    """锁定的容器没有表格行（语义收窄前的 0 行场景）→ ValueError 人话。"""
+    real_page.set_content(
+        '<html><body><ul id="wrap"><li>卡片一</li><li>卡片二</li></ul></body></html>')
+    with pytest.raises(ValueError, match=ZERO_ROWS_PREFIX) as ei:
+        extract_table(real_page, "#wrap", None)
+    assert "识别到" in str(ei.value)  # 人话指引：看到记录面板再确认
+
+
+def test_extract_table_header_only_raises(real_page):
+    """只有表头没有数据行 → 同样按 0 行失败，不产空产物。"""
+    real_page.set_content('<html><body><table id="t"><tr><th>名称</th></tr></table></body></html>')
+    with pytest.raises(ValueError, match=ZERO_ROWS_PREFIX):
+        extract_table(real_page, "#t", None)
+
+
+def test_extract_table_empty_columns_raises(real_page, table_site):
+    """columns=[] 一列没勾 → ValueError 明说至少勾一列（不产无列空表）。"""
+    real_page.goto(f"{table_site}/table")
+    with pytest.raises(ValueError, match="至少勾选一列"):
+        extract_table(real_page, "#data", [])

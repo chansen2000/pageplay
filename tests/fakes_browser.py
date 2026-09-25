@@ -17,19 +17,21 @@ _TABLE = {"headers": ["名称", "价格", "库存", "链接"],
 
 
 class PickPage:
-    """pick 替身页面：goto 记录 + 固定最终落点 url；带表数据可当场执行。"""
+    """pick 替身页面：goto 记录 + 固定最终落点 url；带表/卡片数据可当场执行。"""
 
-    def __init__(self, landed_url: str, table: dict | None = None) -> None:
+    def __init__(self, landed_url: str, table: dict | None = None,
+                 cards: list | None = None) -> None:
         self.url = landed_url
         self.goto_urls: list[str] = []
         self.table = table or {}
+        self.cards = cards or []  # cards 确认（extract_cards）的替身返回
         self.closed = False
 
     def goto(self, url: str) -> None:
         self.goto_urls.append(url)
 
-    def eval_on_selector(self, selector: str, js: str) -> dict:
-        return self.table
+    def eval_on_selector(self, selector: str, js: str, *args) -> dict:
+        return self.cards if args else self.table  # 第 3 参 = fields（卡片）
 
     def close(self) -> None:
         self.closed = True
@@ -59,7 +61,7 @@ class RunPage:
         if self.wait_error is not None:
             raise self.wait_error
 
-    def eval_on_selector(self, selector: str, js: str) -> dict:
+    def eval_on_selector(self, selector: str, js: str, *args) -> dict:
         return self.table
 
     def close(self) -> None:

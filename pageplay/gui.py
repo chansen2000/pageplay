@@ -47,7 +47,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REQUIRES_SITE = frozenset({"login", "doctor", "open", "record", "export"})
 _OPERATIONS = frozenset({
     "login", "doctor", "open", "record", "run", "export",
-    "results", "flows", "recipes", "shutdown", "grab",
+    "results", "flows", "recipes", "shutdown", "grab", "vision",
 })
 
 
@@ -55,11 +55,12 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     """把 GUI 操作翻译成完整 pageplay argv（纯函数，单测锚点）。
 
     op ∈ {login, doctor, open, record, run, export, results, flows,
-    recipes, shutdown, grab}；params 只认三个键：site_or_url（顶部站点/网址
-    输入框）、name（名称输入框，record 时作 --name；run 时作重放名）、
-    headless（run 时作 --headless）。多余的键忽略；非法 op → ValueError。
+    recipes, shutdown, grab, vision}；params 只认三个键：site_or_url（顶部
+    站点/网址输入框）、name（名称输入框，record 时作 --name；run 时作
+    重放名）、headless（run 时作 --headless）。多余的键忽略；非法 op →
+    ValueError。
     - login/doctor/open/record/export 必填 site_or_url，缺 → ValueError
-    - grab 站点可选（给了才传：仅用于命名与落账归属）
+    - grab/vision 站点可选（给了才传：仅用于命名与落账归属）
     - run 必填 name（下拉选中的流程/recipe 名），缺 → ValueError
     - record 有 name 才传 --name（GUI 侧由 next_record_name 保证非空）
     - run 有 headless 才传 --headless
@@ -77,7 +78,7 @@ def build_command(op: str, params: dict | None = None) -> list[str]:
     argv = [op]
     if op in _REQUIRES_SITE:
         argv.append(site)
-    if op == "grab" and site:  # 站点可选：给了才传
+    if op in ("grab", "vision") and site:  # 站点可选：给了才传
         argv.append(site)
     if op == "run":
         argv.append(name)
@@ -180,6 +181,7 @@ class App:
         row_a.pack(fill="x", pady=(2, 0))
         add_button(row_a, "打开窗口", "open")
         add_button(row_a, "③ 取当前页", "grab")
+        add_button(row_a, "视觉抓取", "vision")
         add_button(row_a, "② 录制", "record")
         add_button(row_a, "④ 重放", "run")
         row_b = ttk.Frame(step2)

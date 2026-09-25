@@ -38,18 +38,19 @@ class GrabPage:
     """当前页替身：title()/url + 抽表/下载能力；记录 close（grab 不该关它）。"""
 
     def __init__(self, url: str = _URL, title: str = "列表页",
-                 table: dict | None = None) -> None:
+                 table: dict | None = None, cards: list | None = None) -> None:
         self.url = url
         self._title = title
         self.table = table or _TABLE
+        self.cards = cards or []  # cards 确认（extract_cards）的替身返回
         self.closed = False
         self.clicked: list[str] = []
 
     def title(self) -> str:
         return self._title
 
-    def eval_on_selector(self, selector: str, js: str) -> dict:
-        return self.table
+    def eval_on_selector(self, selector: str, js: str, *args) -> dict:
+        return self.cards if args else self.table  # 第 3 参 = fields（卡片）
 
     def expect_download(self):
         info = type("DlInfo", (), {"value": FakeDownload()})()
@@ -92,12 +93,14 @@ def install_grab_browser(monkeypatch, pages: list) -> list[bool]:
     return headless_calls
 
 
-def fake_confirm(action: str = "table", columns=None):
+def fake_confirm(action: str = "table", columns=None, list_mode=None,
+                 fields=None):
     """造一个"替人确认一次"的 run_pick 替身（断言单条模式）。"""
     def _run_pick(page, on_confirm, repeat=False):
         assert repeat is False  # grab 单条模式，不开框选会话
         on_confirm({"selector": "#t1", "action": action,
-                    "columns": columns, "rect": {}, "url": page.url})
+                    "columns": columns, "list_mode": list_mode,
+                    "fields": fields, "rect": {}, "url": page.url})
         return {"selector": "#t1"}
 
     return _run_pick
@@ -208,6 +211,46 @@ def test_grab_execution_fail_exit_one_and_fail_record(home_dir, tmp_path,
     assert "不存在的列" in capsys.readouterr().err
     (entry,) = load_runs(_runs_path())
     assert entry["action"] == "grab" and entry["status"] == "fail"
+
+
+# ----------------------------------------------------------------------
+# T20：0 行 = 失败（退出码 1 + fail 账）；卡片确认当场走 extract_cards
+# ----------------------------------------------------------------------
+
+def test_grab_zero_rows_exit_one_fail_record(home_dir, tmp_path,
+                                             monkeypatch, capsys):
+    """锁定的目标没有可读数据行：✗ 人话 + fail 账 + 退出码 1，不产空文件。"""
+    fake_downloads_home(monkeypatch, tmp_path)
+    install_grab_browser(monkeypatch,
+                         [GrabPage(table={"headers": ["名称"], "data": []})])
+    monkeypatch.setattr("pageplay.picker.run_pick",
+                        fake_confirm(columns=["名称"]))
+
+    assert main(["grab"]) == 1
+
+    captured = capsys.readouterr()
+    assert "提取到 0 行" in captured.err and "✗" in captured.err
+    (entry,) = load_runs(_runs_path())
+    assert entry["action"] == "grab" and entry["status"] == "fail"
+    assert "提取到 0 行" in entry["detail"] and entry["outputs"] == []
+
+
+def test_grab_cards_confirm_extracts_cards(home_dir, tmp_path, monkeypatch):
+    """卡片组确认（list_mode=cards + fields）当场抓卡片：CSV 表头+3 行。"""
+    fake_downloads_home(monkeypatch, tmp_path)
+    install_grab_browser(monkeypatch, [GrabPage(cards=[
+        {"订单号": f"TB900{i}"} for i in range(1, 4)])])
+    monkeypatch.setattr("pageplay.picker.run_pick", fake_confirm(
+        list_mode="cards",
+        fields=[{"label": "订单号", "rel": [{"tag": "div", "nth": 1}]}]))
+
+    assert main(["grab"]) == 0
+
+    (entry,) = load_runs(_runs_path())
+    assert entry["action"] == "grab" and entry["status"] == "ok"
+    assert "3 行" in entry["detail"]
+    lines = Path(entry["outputs"][0]).read_bytes().decode("utf-8-sig").splitlines()
+    assert lines[0] == "订单号" and len(lines) == 4
 
 
 def test_grab_risk_exits_two(home_dir, tmp_path, monkeypatch):

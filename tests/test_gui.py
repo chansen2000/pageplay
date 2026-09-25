@@ -102,6 +102,21 @@ def test_grab_site_is_optional():
 
 
 # ----------------------------------------------------------------------
+# vision（T21a）：站点可选（同 grab）
+# ----------------------------------------------------------------------
+
+def test_vision_site_is_optional():
+    """vision：给了站点才传（仅命名/落账用），不给就是裸 vision。"""
+    assert build_command("vision") == ["vision"]
+    assert build_command("vision", {"site_or_url": "taobao"}) \
+        == ["vision", "taobao"]
+    assert build_command("vision", {"site_or_url": " www.taobao.com "}) \
+        == ["vision", "www.taobao.com"]  # 首尾空白剥掉
+    assert build_command("vision", {"name": "x", "headless": True}) \
+        == ["vision"]  # name/headless 对 vision 无意义，忽略
+
+
+# ----------------------------------------------------------------------
 # next_record_name（T13.3）：录制缺名自动起名
 # ----------------------------------------------------------------------
 
@@ -271,7 +286,7 @@ def test_gui_source_keeps_wizard_layout_markers():
     source = Path(pageplay.gui.__file__).read_text(encoding="utf-8")
     for marker in ("第 1 步", "第 2 步", "第 3 步", "管理（低频）",
                    "① 登录", "② 录制", "③ 取当前页", "④ 重放",
-                   "2A 临时抓一页", "2B 反复自动抓"):
+                   "2A 临时抓一页", "2B 反复自动抓", "视觉抓取"):
         assert marker in source, f"GUI 源码缺少向导布局标记：{marker!r}"
 
 
