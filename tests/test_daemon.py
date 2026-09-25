@@ -404,7 +404,11 @@ def test_run_login_bounce_recovers_after_human_passes(
     → 自动续跑抓表落盘。全链走 cli.main 真入口。"""
     _seed_collab_site(daemon, collab_site)  # recipe/首页都在中性主机
     out_dir = tmp_path / "collab-out"
-    monkeypatch.setattr("pageplay.session.time.sleep", lambda _s: None)
+    # 有意【不】打 no-op sleep 补丁（pageplay.session.time 即全局 time 模块，
+    # 全局打掉 sleep 会把产品 2s 轮询变成热旋 CDP 轰炸，满载下反而饿死假站
+    # 页的 load/定时器——2026-09-25 全量偶发失败的负载来源）。本用例按生产
+    # 真实节奏等被测行为：cookie 落袋由 ensure_logged_in 轮询（2s 间隔、
+    # 120s 预算）等到，测试不赌时间点。
     # 系统代理变量（http_proxy/ALL_PROXY 等）会劫持 connect_over_cdp 的
     # 本机回环请求：_cdp_alive 走 _OPENER 直连拿到 200，playwright driver
     # 却遵循代理变量经代理转发 → 503（2026-09-24 实测，含/不含代理变量

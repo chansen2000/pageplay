@@ -239,15 +239,25 @@ def nav_site():
 # T10：风控协作假站（登录反弹 → 人过验证 → 自动续跑）
 # ---------------------------------------------------------------------------
 
+# 时序来源（防 flaky 约定，2026-09-25 全量偶发失败整改）：跳 /pass 的延时
+# 锚定在 load 事件之后而非脚本求值时刻——page.goto 默认等 load 才返回，
+# "load 后才起表"保证 goto 的在途等待永远先于跳转完成，满载下也不会出现
+# 定时器打断在途导航；1.5s 余量给紧随 goto 的反弹判定/风控扫描（微秒级
+# 读）让路。cookie 落袋由产品侧 ensure_logged_in 轮询（2s 间隔、120s 预算）
+# 等到，测试不赌任何固定时间点。
 _COLLAB_LOGIN_HTML = """<html><body>
 <h1>安全验证</h1>
 <p>滑块验证：请拖动滑块完成拼图</p>
-<script>setTimeout(function () {{ location.href = "{pass_url}"; }}, 600);</script>
+<script>window.addEventListener("load", function () {{
+  setTimeout(function () {{ location.href = "{pass_url}"; }}, 1500);
+}});</script>
 </body></html>"""
 
 _COLLAB_HOME_HTML = """<html><body>
 <h1>站点首页</h1>
-<script>setTimeout(function () {{ location.href = "{pass_url}"; }}, 600);</script>
+<script>window.addEventListener("load", function () {{
+  setTimeout(function () {{ location.href = "{pass_url}"; }}, 1500);
+}});</script>
 </body></html>"""
 
 _COLLAB_TABLE_HTML = """<html><body>

@@ -1,7 +1,8 @@
 """grab 命令：从浏览器「当前页」框选取数（T14）。
 
 与 pick 的区别：不导航、不开新页——ensure_browser(headless=False) 附着
-后取 contexts[0].pages 最后一个（最近打开 = 用户当前正在看的页），就在
+后由 target_page.pick_target_page 选「人正看着的可见标签页」（T19：不
+再取 pages[-1]，真机 8 标签页实测最后一个可能是空白新标签页），就在
 该页跑 picker.run_pick 单条模式（repeat=False）。确认后当场执行并落账，
 但不存 recipe：grab 是一次性取数，沉淀 recipe/流程仍归 pick/record。
 账本 action 记 "grab"（ledger_action，执行语义随框选结果本身）。
@@ -24,6 +25,7 @@ from . import picker
 from .cli_pick import _execute_and_record, _products_root
 from .session import ensure_browser
 from .sites import parse_target
+from .target_page import pick_target_page
 
 
 def _label_from_site_arg(arg: str) -> str:
@@ -58,13 +60,11 @@ def _cmd_grab(args: argparse.Namespace) -> int:
     """grab：附着活窗取当前页，框选一次、当场执行落账（不存 recipe）。"""
     browser = ensure_browser(headless=False)  # 只附着，绝不关浏览器
     context = browser.contexts[0]
-    pages = list(getattr(context, "pages", None) or [])
-    if not pages:
-        print("当前浏览器没有打开任何标签页：先打开窗口"
-              "（pageplay open <站点或网址>）或先浏览到目标页，再 grab",
-              file=sys.stderr)
+    try:
+        page = pick_target_page(context)  # T19：人正看着的可见标签页
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)  # 人话（含"先打开窗口"指引）
         return 1
-    page = pages[-1]  # 最近打开的标签 = 用户当前正在看的页
     try:
         title = page.title() or ""
     except Exception:
