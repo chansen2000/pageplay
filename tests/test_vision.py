@@ -1,11 +1,16 @@
-"""vision 命令单测（T21a）：视觉解析纯函数、模型调用替身、CLI 集成。
+"""vision 命令单测（T21a GLM 视觉路）：解析纯函数、模型调用替身、CLI 集成。
 
-零真实外网、零真浏览器：模型调用在 vision._post（urllib 收敛点）与
+零真实外网、零真浏览器：GLM 模型调用在 vision._post（urllib 收敛点）与
 vision.screenshot_table 打桩；_post 本身用本地 ThreadingHTTPServer
 （127.0.0.1，端口 0）验真实 urllib 路径与鉴权头，仍不出本机。CLI 集成
 浏览器附着在 cli_vision 命名空间打桩（替身页同 grab：url/title 即够，
 pick_target_page 用真的——替身页无 evaluate 按 hidden 回落取最后页），
 落盘走真 actions.save_table、落账走真 runs.jsonl。
+
+T22 起缺省引擎是 local（本地 OCR），GLM 流程用例显式 engine="glm"；
+本地引擎用例（聚类/空格收敛纯函数、真实 OCR、引擎路由、--engine CLI）
+在 test_vision_local.py（按引擎职责拆分，单文件 ≤500），共享替身与常量
+（_KEY/_ROWS/ShotPage/VisionPage/打桩）仍在本文件供其导入。
 """
 
 from __future__ import annotations
@@ -154,7 +159,10 @@ class ShotPage:
 
 
 def test_screenshot_table_success_builds_payload(monkeypatch):
-    """成功路：png→base64 data url + PROMPT + 缺省模型 + temperature。"""
+    """成功路：png→base64 data url + PROMPT + 缺省模型 + temperature。
+
+    T22 起 engine 缺省是 local，GLM 流程必须显式 engine="glm" 才走到。
+    """
     posts: list[tuple[dict, str]] = []
 
     def fake_post(payload: dict, api_key: str) -> str:
@@ -164,7 +172,7 @@ def test_screenshot_table_success_builds_payload(monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", _KEY)
     monkeypatch.setattr(vision, "_post", fake_post)
 
-    rows = screenshot_table(ShotPage())
+    rows = screenshot_table(ShotPage(), engine="glm")
 
     assert rows == _ROWS
     assert posts[0][1] == _KEY  # key 原样传给请求层
@@ -188,12 +196,14 @@ def test_screenshot_table_model_override(monkeypatch):
 
     monkeypatch.setenv("GLM_API_KEY", _KEY)
     monkeypatch.setattr(vision, "_post", fake_post)
-    assert screenshot_table(ShotPage(), model="glm-4v-flash") == []
+    assert screenshot_table(ShotPage(), engine="glm",
+                            model="glm-4v-flash") == []
     assert seen == ["glm-4v-flash"]
 
 
 def test_screenshot_table_missing_key_valueerror(monkeypatch):
-    """GLM_API_KEY 未设且未显式传：ValueError 人话指引，且不发请求。"""
+    """engine="glm" 且 GLM_API_KEY 未设且未显式传：ValueError 人话指引，
+    且不发请求（local 缺省路不需要 key，见 local 路由用例）。"""
     monkeypatch.delenv("GLM_API_KEY", raising=False)
 
     def boom(payload, api_key):  # 缺 key 不该走到请求层
@@ -201,7 +211,7 @@ def test_screenshot_table_missing_key_valueerror(monkeypatch):
 
     monkeypatch.setattr(vision, "_post", boom)
     with pytest.raises(ValueError, match="GLM_API_KEY"):
-        screenshot_table(ShotPage())
+        screenshot_table(ShotPage(), engine="glm")
 
 
 def test_screenshot_table_explicit_key_wins(monkeypatch):
@@ -210,7 +220,7 @@ def test_screenshot_table_explicit_key_wins(monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "env-key")
     monkeypatch.setattr(vision, "_post",
                         lambda p, k: seen.append(k) or "{\"rows\": []}")
-    assert screenshot_table(ShotPage(), api_key=_KEY) == []
+    assert screenshot_table(ShotPage(), engine="glm", api_key=_KEY) == []
     assert seen == [_KEY]
 
 
@@ -253,31 +263,37 @@ def install_vision_browser(monkeypatch, pages: list) -> list[bool]:
     return headless_calls
 
 
-def stub_vision(monkeypatch, rows: list[dict]) -> list:
-    """screenshot_table 打桩：返回给定行，记录收到的 page。"""
+def stub_vision(monkeypatch, rows: list[dict]) -> tuple[list, list[str]]:
+    """screenshot_table 打桩：返回给定行，记录收到的 page 与 engine。"""
     seen: list = []
+    engines: list[str] = []
 
-    def fake_table(page, api_key=None, model=None):
+    def fake_table(page, engine="local", api_key=None, model=None):
         seen.append(page)
+        engines.append(engine)
         return rows
 
     monkeypatch.setattr("pageplay.vision.screenshot_table", fake_table)
-    return seen
+    return seen, engines
 
 
 def test_vision_success_saves_csv_and_records(home_dir, tmp_path, monkeypatch,
                                               capsys):
-    """识别到 2 行：CSV+JSON 落 vision 目录，账本记 vision ok，退出码 0。"""
+    """识别到 2 行：CSV+JSON 落 vision 目录，账本记 vision ok，退出码 0。
+
+    T22 起缺省引擎是 local（提示文案与打桩收到的 engine 相应断言）。
+    """
     fake_home = fake_downloads_home(monkeypatch, tmp_path)
     page = VisionPage()
     install_vision_browser(monkeypatch, [page])
-    seen = stub_vision(monkeypatch, _ROWS)
+    seen, engines = stub_vision(monkeypatch, _ROWS)
 
     assert main(["vision", "taobao"]) == 0
 
     assert seen == [page]  # 选中的当前页原样交给视觉层
+    assert engines == ["local"]  # 缺省走本地引擎
     out = capsys.readouterr().out
-    assert "将截取该页画面交给视觉模型识别：列表页" in out
+    assert "将截取该页画面交给本地 OCR（离线）识别：列表页" in out
     assert "✓ 视觉抓取 2 行" in out
     vision_root = fake_home / "Downloads" / "pageplay" / "vision"
     (csv_path,) = vision_root.glob("taobao-vision-*.csv")
@@ -291,14 +307,14 @@ def test_vision_success_saves_csv_and_records(home_dir, tmp_path, monkeypatch,
 
 def test_vision_empty_rows_exit_one_fail_record(home_dir, tmp_path,
                                                 monkeypatch, capsys):
-    """模型说没有表格：人话 ✗ + fail 账（outputs 空），退出码 1。"""
+    """引擎说没有表格：人话 ✗ + fail 账（outputs 空），退出码 1。"""
     fake_downloads_home(monkeypatch, tmp_path)
     install_vision_browser(monkeypatch, [VisionPage()])
     stub_vision(monkeypatch, [])
 
     assert main(["vision", "taobao"]) == 1
 
-    assert "✗ 视觉模型没有识别到表格" in capsys.readouterr().out
+    assert "✗ 本地 OCR（离线）没有识别到表格" in capsys.readouterr().out
     (entry,) = load_runs(_runs_path())
     assert entry["status"] == "fail" and entry["outputs"] == []
 
@@ -331,13 +347,14 @@ def test_vision_custom_out_dir(home_dir, tmp_path, monkeypatch):
 
 def test_vision_missing_key_human_message_exit_one(home_dir, tmp_path,
                                                    monkeypatch, capsys):
-    """GLM_API_KEY 未设：main 人话映射「执行失败：视觉抓取需要
-    GLM_API_KEY …」，退出码 1（走真 screenshot_table，不发请求）。"""
+    """--engine glm 且 GLM_API_KEY 未设：main 人话映射「执行失败：视觉抓取
+    需要 GLM_API_KEY …」，退出码 1（走真 screenshot_table，不发请求；
+    T22 起缺省 local 不需要 key，glm 才校验）。"""
     fake_downloads_home(monkeypatch, tmp_path)
     install_vision_browser(monkeypatch, [VisionPage()])
     monkeypatch.delenv("GLM_API_KEY", raising=False)
 
-    assert main(["vision", "taobao"]) == 1
+    assert main(["vision", "taobao", "--engine", "glm"]) == 1
 
     err = capsys.readouterr().err
     assert "视觉抓取需要 GLM_API_KEY 环境变量（bigmodel 密钥），设置后重试" \
@@ -351,7 +368,7 @@ def test_vision_service_error_exit_one(home_dir, tmp_path, monkeypatch,
     fake_downloads_home(monkeypatch, tmp_path)
     install_vision_browser(monkeypatch, [VisionPage()])
 
-    def boom(page, api_key=None, model=None):
+    def boom(page, engine="local", api_key=None, model=None):
         raise RuntimeError("连不上视觉服务；请检查网络后重试")
 
     monkeypatch.setattr("pageplay.vision.screenshot_table", boom)
@@ -365,7 +382,7 @@ def test_vision_risk_exits_two(home_dir, tmp_path, monkeypatch):
     fake_downloads_home(monkeypatch, tmp_path)
     install_vision_browser(monkeypatch, [VisionPage()])
 
-    def risk(page, api_key=None, model=None):
+    def risk(page, engine="local", api_key=None, model=None):
         raise RiskTriggered("响应命中风控关键词：滑块")
 
     monkeypatch.setattr("pageplay.vision.screenshot_table", risk)
@@ -383,3 +400,4 @@ def test_vision_zero_pages_human_message_exit_one(home_dir, tmp_path,
     assert main(["vision"]) == 1
 
     assert "先打开窗口" in capsys.readouterr().err
+
