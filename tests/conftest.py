@@ -491,3 +491,210 @@ def card_site():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# v0.10：淘宝形态列表假站（listscan 引擎 / picker list 面板 / runner 用）
+# ---------------------------------------------------------------------------
+
+# 6 单 10 件（每单 1/2/3/1/1/2 件），复刻真机买家订单页形态（设计 §2/§8）：
+# - 全部语义 class 带 -- 哈希后缀；表头 orderHeader 与订单兄弟同层（不同 sem）
+# - 价格 4 段 span（￥/650/./00）同行相邻；"订单号: " 与号码同宿主（§2 实测形态）
+# - 首单内嵌 extBlank 推荐区（"常买常逛-推荐商品位"）；旺旺在线 display:none
+# - 商品标题宿主在 a[href] 内
+_LIST_HTML = """<html><head><style>
+.order{margin:12px 0;padding:6px;border:1px solid #eee}
+.hd{display:block;font-weight:bold}
+.tipHidden{display:none}
+[class*='itemInfo'] a,[class*='itemSku'],[class*='qty']{display:block}
+</style></head><body>
+<div class="tradeContent--Wrap0">
+  <div class="orderHeader--Hd00">订单信息 | 商品 | 单价 | 数量 | 实付款 | 操作</div>
+
+  <div class="tradeOrder--A100"><div class="shopInfo--B100">
+    <span class="orderTime--C100">2026-09-21</span>
+    <span class="orderId--D100">订单号: 8801</span>
+    <a class="shopName--E100" href="/shop/minguang">敏光企业店</a>
+    <span class="orderStatus--F100">卖家已发货</span>
+    <span class="payTotal--G100"><span class="payLabel--H100">实付款</span><span class="pSymbol--I100">￥</span><span class="pInt--J100">650</span><span class="pDot--K100">.</span><span class="pDec--L100">00</span></span>
+    <span class="tipHidden--M100">旺旺在线</span>
+  </div>
+  <div class="itemList--N100">
+    <div class="itemInfo--O100"><a class="itemTitle--P100" href="/item/lsspd">LSSPD-1.2 光电探测器</a><span class="itemSku--Q100">LSSPD-1.2-3P 3管脚</span><span class="itemPrice--R100"><span class="pSymbol--I100">￥</span><span class="pInt--J100">50</span><span class="pDot--K100">.</span><span class="pDec--L100">00</span></span><span class="qty--S100">x13</span></div>
+  </div>
+  <div class="extBlank--T100"><div class="recText--U100">常买常逛-推荐商品位</div></div>
+  </div>
+
+  <div class="tradeOrder--A200"><div class="shopInfo--B200">
+    <span class="orderTime--C200">2026-09-17</span>
+    <span class="orderId--D200">订单号: 8802</span>
+    <a class="shopName--E200" href="/shop/baobao">宝宝家居</a>
+    <span class="orderStatus--F200">卖家已发货</span>
+    <span class="payTotal--G200"><span class="payLabel--H200">实付款</span><span class="pSymbol--I200">￥</span><span class="pInt--J200">144</span><span class="pDot--K200">.</span><span class="pDec--L200">40</span></span>
+  </div>
+  <div class="itemList--N200">
+    <div class="itemInfo--O200"><a class="itemTitle--P200" href="/item/gui30">收纳柜 30CM版</a><span class="itemSku--Q200">30CM1大3小【白色】</span><span class="itemPrice--R200"><span class="pSymbol--I200">￥</span><span class="pInt--J200">79</span><span class="pDot--K200">.</span><span class="pDec--L200">00</span></span><span class="qty--S200">x1</span></div>
+    <div class="itemInfo--O200"><a class="itemTitle--P200" href="/item/gui20">收纳柜 20CM版</a><span class="itemSku--Q200">20CM1大3小【白色】</span><span class="itemPrice--R200"><span class="pSymbol--I200">￥</span><span class="pInt--J200">65</span><span class="pDot--K200">.</span><span class="pDec--L200">40</span></span><span class="qty--S200">x1</span></div>
+  </div></div>
+
+  <div class="tradeOrder--A300"><div class="shopInfo--B300">
+    <span class="orderTime--C300">2026-09-15</span>
+    <span class="orderId--D300">订单号: 8803</span>
+    <a class="shopName--E300" href="/shop/dianyuan">电源之家</a>
+    <span class="orderStatus--F300">已签收</span>
+    <span class="payTotal--G300"><span class="payLabel--H300">实付款</span><span class="pSymbol--I300">￥</span><span class="pInt--J300">300</span><span class="pDot--K300">.</span><span class="pDec--L300">00</span></span>
+  </div>
+  <div class="itemList--N300">
+    <div class="itemInfo--O300"><a class="itemTitle--P300" href="/item/dy1">12V 电源 A</a><span class="itemSku--Q300">12V 2A</span><span class="itemPrice--R300"><span class="pSymbol--I300">￥</span><span class="pInt--J300">100</span><span class="pDot--K300">.</span><span class="pDec--L300">00</span></span><span class="qty--S300">x1</span></div>
+    <div class="itemInfo--O300"><a class="itemTitle--P300" href="/item/dy2">12V 电源 B</a><span class="itemSku--Q300">12V 5A</span><span class="itemPrice--R300"><span class="pSymbol--I300">￥</span><span class="pInt--J300">120</span><span class="pDot--K300">.</span><span class="pDec--L300">00</span></span><span class="qty--S300">x1</span></div>
+    <div class="itemInfo--O300"><a class="itemTitle--P300" href="/item/dy3">12V 电源 C</a><span class="itemSku--Q300">24V 2A</span><span class="itemPrice--R300"><span class="pSymbol--I300">￥</span><span class="pInt--J300">80</span><span class="pDot--K300">.</span><span class="pDec--L300">00</span></span><span class="qty--S300">x1</span></div>
+  </div></div>
+
+  <div class="tradeOrder--A400"><div class="shopInfo--B400">
+    <span class="orderTime--C400">2026-09-12</span>
+    <span class="orderId--D400">订单号: 8804</span>
+    <a class="shopName--E400" href="/shop/xiancai">线材铺</a>
+    <span class="orderStatus--F400">已签收</span>
+    <span class="payTotal--G400"><span class="payLabel--H400">实付款</span><span class="pSymbol--I400">￥</span><span class="pInt--J400">25</span><span class="pDot--K400">.</span><span class="pDec--L400">50</span></span>
+  </div>
+  <div class="itemList--N400">
+    <div class="itemInfo--O400"><a class="itemTitle--P400" href="/item/cable">USB 线 1 米</a><span class="itemSku--Q400">Type-C</span><span class="itemPrice--R400"><span class="pSymbol--I400">￥</span><span class="pInt--J400">25</span><span class="pDot--K400">.</span><span class="pDec--L400">50</span></span><span class="qty--S400">x1</span></div>
+  </div></div>
+
+  <div class="tradeOrder--A500"><div class="shopInfo--B500">
+    <span class="orderTime--C500">2026-09-10</span>
+    <span class="orderId--D500">订单号: 8805</span>
+    <a class="shopName--E500" href="/shop/tiepian">贴片世界</a>
+    <span class="orderStatus--F500">卖家已发货</span>
+    <span class="payTotal--G500"><span class="payLabel--H500">实付款</span><span class="pSymbol--I500">￥</span><span class="pInt--J500">9</span><span class="pDot--K500">.</span><span class="pDec--L500">90</span></span>
+  </div>
+  <div class="itemList--N500">
+    <div class="itemInfo--O500"><a class="itemTitle--P500" href="/item/chip0805">贴片电阻 0805</a><span class="itemSku--Q500">10K 1%</span><span class="itemPrice--R500"><span class="pSymbol--I500">￥</span><span class="pInt--J500">9</span><span class="pDot--K500">.</span><span class="pDec--L500">90</span></span><span class="qty--S500">x1</span></div>
+  </div></div>
+
+  <div class="tradeOrder--A600"><div class="shopInfo--B600">
+    <span class="orderTime--C600">2026-09-08</span>
+    <span class="orderId--D600">订单号: 8806</span>
+    <a class="shopName--E600" href="/shop/wanbiao">万表阁</a>
+    <span class="orderStatus--F600">待发货</span>
+    <span class="payTotal--G600"><span class="payLabel--H600">实付款</span><span class="pSymbol--I600">￥</span><span class="pInt--J600">520</span><span class="pDot--K600">.</span><span class="pDec--L600">00</span></span>
+  </div>
+  <div class="itemList--N600">
+    <div class="itemInfo--O600"><a class="itemTitle--P600" href="/item/watchA">机械表 A 款</a><span class="itemSku--Q600">黑盘钢带</span><span class="itemPrice--R600"><span class="pSymbol--I600">￥</span><span class="pInt--J600">300</span><span class="pDot--K600">.</span><span class="pDec--L600">00</span></span><span class="qty--S600">x1</span></div>
+    <div class="itemInfo--O600"><a class="itemTitle--P600" href="/item/watchB">机械表 B 款</a><span class="itemSku--Q600">白盘皮带</span><span class="itemPrice--R600"><span class="pSymbol--I600">￥</span><span class="pInt--J600">220</span><span class="pDot--K600">.</span><span class="pDec--L600">00</span></span><span class="qty--S600">x1</span></div>
+  </div></div>
+</div>
+</body></html>"""
+
+
+class _ListSiteHandler(BaseHTTPRequestHandler):
+    """淘宝形态列表假站：GET /list → 6 单 10 件订单列表页。"""
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/list"):
+            self._send_html(200, _LIST_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def list_site():
+    """起淘宝形态列表假站（端口 0），yield base_url，测完关停。
+
+    路由：GET /list → 6 单 10 件订单页（哈希 class、表头兄弟、价格 4 段
+    span、首单内嵌推荐区、display:none 文本、a[href] 标题，§2/§8 形态）。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ListSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# v0.10：文件假站（download_links：3 个像文件链接 + 1 个普通链接 + 1 个去重）
+# ---------------------------------------------------------------------------
+
+_FILES = {"a.pdf": b"%PDF-fake-a", "b.xlsx": b"XLSX-fake-b", "c.bin": b"BIN-fake-c"}
+_LINKS_PAGE = """<html><body><div id="box">
+  <a id="f1" href="/files/a.pdf">报表A</a>
+  <a id="f2" href="/files/b.xlsx">报表B</a>
+  <a id="f3" href="/files/c.bin" download>打包C</a>
+  <a id="f4" href="/home">普通链接（不像文件）</a>
+  <a id="f5" href="/files/a.pdf">报表A重复（去重用）</a>
+</div></body></html>"""
+
+
+class _FileSiteHandler(BaseHTTPRequestHandler):
+    """文件假站：/links 链接页 + /files/* 字节（a.pdf 带 Content-Disposition）。"""
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/links"):
+            self._send_html(200, _LINKS_PAGE)
+        elif self.path.startswith("/files/"):
+            name = self.path.rsplit("/", 1)[-1]
+            data = _FILES.get(name)
+            if data is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            if name == "a.pdf":  # 文件名优先级：Content-Disposition > URL 末段
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="report-a.pdf"')
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/home"):
+            self._send_html(200, "<html><body>普通页</body></html>")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send_html(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass
+
+
+@pytest.fixture
+def file_site():
+    """起文件假站（端口 0）：GET /links 链接页、/files/* 字节、/home 普通页。
+
+    a.pdf 落 Content-Disposition（文件名优先级用例）；b.xlsx 靠扩展名、
+    c.bin 靠 download 属性凑「像文件」三通道；/home 不像文件不下载。
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FileSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

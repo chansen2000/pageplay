@@ -38,19 +38,23 @@ class GrabPage:
     """当前页替身：title()/url + 抽表/下载能力；记录 close（grab 不该关它）。"""
 
     def __init__(self, url: str = _URL, title: str = "列表页",
-                 table: dict | None = None, cards: list | None = None) -> None:
+                 table: dict | None = None,
+                 list_rows: list | None = None) -> None:
         self.url = url
         self._title = title
         self.table = table or _TABLE
-        self.cards = cards or []  # cards 确认（extract_cards）的替身返回
+        self.list_rows = list_rows or []  # list 确认（listscan.extract）替身返回
         self.closed = False
         self.clicked: list[str] = []
 
     def title(self) -> str:
         return self._title
 
+    def evaluate(self, js: str, arg=None):
+        return self.list_rows  # listscan._inject / extract 都经 evaluate
+
     def eval_on_selector(self, selector: str, js: str, *args) -> dict:
-        return self.cards if args else self.table  # 第 3 参 = fields（卡片）
+        return self.table
 
     def expect_download(self):
         info = type("DlInfo", (), {"value": FakeDownload()})()
@@ -94,13 +98,15 @@ def install_grab_browser(monkeypatch, pages: list) -> list[bool]:
 
 
 def fake_confirm(action: str = "table", columns=None, list_mode=None,
-                 fields=None):
+                 record_selector=None, sub_sem=None, download=None,
+                 colnames=None):
     """造一个"替人确认一次"的 run_pick 替身（断言单条模式）。"""
-    def _run_pick(page, on_confirm, repeat=False):
+    def _run_pick(page, on_confirm, repeat=False, colnames=None):
         assert repeat is False  # grab 单条模式，不开框选会话
         on_confirm({"selector": "#t1", "action": action,
                     "columns": columns, "list_mode": list_mode,
-                    "fields": fields, "rect": {}, "url": page.url})
+                    "record_selector": record_selector, "sub_sem": sub_sem,
+                    "download": download, "rect": {}, "url": page.url})
         return {"selector": "#t1"}
 
     return _run_pick
@@ -190,7 +196,7 @@ def test_grab_cancelled_exit_one(home_dir, tmp_path, monkeypatch, capsys):
     fake_downloads_home(monkeypatch, tmp_path)
     install_grab_browser(monkeypatch, [GrabPage()])
 
-    def cancelled(page, on_confirm, repeat=False):
+    def cancelled(page, on_confirm, repeat=False, colnames=None):
         raise PickCancelled("人按 Esc 取消了框选")
 
     monkeypatch.setattr("pageplay.picker.run_pick", cancelled)
@@ -235,14 +241,16 @@ def test_grab_zero_rows_exit_one_fail_record(home_dir, tmp_path,
     assert "提取到 0 行" in entry["detail"] and entry["outputs"] == []
 
 
-def test_grab_cards_confirm_extracts_cards(home_dir, tmp_path, monkeypatch):
-    """卡片组确认（list_mode=cards + fields）当场抓卡片：CSV 表头+3 行。"""
+def test_grab_list_confirm_extracts_list(home_dir, tmp_path, monkeypatch):
+    """列表确认（list_mode=list + record_selector/columns）当场抓列表：
+    CSV 表头+3 行。"""
     fake_downloads_home(monkeypatch, tmp_path)
-    install_grab_browser(monkeypatch, [GrabPage(cards=[
+    install_grab_browser(monkeypatch, [GrabPage(list_rows=[
         {"订单号": f"TB900{i}"} for i in range(1, 4)])])
     monkeypatch.setattr("pageplay.picker.run_pick", fake_confirm(
-        list_mode="cards",
-        fields=[{"label": "订单号", "rel": [{"tag": "div", "nth": 1}]}]))
+        list_mode="list",
+        record_selector="div.list > div.card",
+        columns=[{"key": "order-no", "name": "订单号", "strip": None}]))
 
     assert main(["grab"]) == 0
 

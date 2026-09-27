@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from . import picker
+from . import listscan, picker
 from .cli_pick import _execute_and_record, _products_root
 from .session import ensure_browser
 from .sites import parse_target
@@ -85,15 +85,22 @@ def _cmd_grab(args: argparse.Namespace) -> int:
     def _handler(result: dict) -> None:
         # 执行 + 落账，不存 recipe；账本 action 记 grab。RiskTriggered
         # 从 _execute_and_record 穿透（run_pick 透传回调异常）→ 退出码 2；
-        # list_mode/fields 原样透传（卡片确认当场走 extract_cards，T20）
+        # 列表/链接契约键原样透传（当场走 listscan/链接提取，v0.10）
+        try:
+            listscan.remember_colnames(label, result.get("columns") or [])
+        except Exception as exc:
+            print(f"（列名记忆写入失败：{exc}）", file=sys.stderr)
         products, _detail = _execute_and_record(
             page, name, str(result["action"]), str(result["selector"]),
             result.get("columns"), out_dir, ledger_action="grab",
-            list_mode=result.get("list_mode"), fields=result.get("fields"))
+            list_mode=result.get("list_mode"),
+            record_selector=result.get("record_selector"),
+            sub_sem=result.get("sub_sem"), download=result.get("download"))
         picked["ok"] = products is not None
 
     try:
-        picker.run_pick(page, _handler)  # 单条模式：不 repeat、不开会话
+        picker.run_pick(page, _handler,  # 单条模式：不 repeat、不开会话
+                        colnames=listscan.load_colnames(label))
     except picker.PickCancelled as exc:
         print(f"已取消：{exc}")
         return 1

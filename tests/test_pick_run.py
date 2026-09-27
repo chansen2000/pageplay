@@ -35,7 +35,7 @@ def test_pick_confirm_table_executes_immediately(home_dir, table_site, tmp_path,
         "data": [[f"商品{i}", str(i * 10), "1", "x"] for i in range(1, 6)]})
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "#data", "action": "table",
                    "columns": ["名称", "价格"], "rect": {"x": 1}}
         on_confirm(payload)  # 与真 picker 同形状：确认即回调
@@ -81,7 +81,7 @@ def test_pick_prints_step_card_and_injection_tab(home_dir, table_site, tmp_path,
     page = PickPage(table_site + "/table")
     install_browser(monkeypatch, page)
     monkeypatch.setattr("pageplay.picker.run_pick",
-                        lambda p, on_confirm, repeat=False: [])
+                        lambda p, on_confirm, repeat=False, colnames=None: [])
 
     assert main(["pick", "faketest"]) == 0
 
@@ -104,7 +104,7 @@ def test_pick_repeat_two_confirms_saves_two_recipes_and_summary(
         "data": [[f"商品{i}", str(i * 10), "1", "x"] for i in range(1, 6)]})
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         assert repeat is True  # T9c：pick 以会话常驻跑
         first = {"selector": "#data", "action": "table",
                  "columns": ["名称"], "rect": {"x": 1}}
@@ -149,7 +149,7 @@ def test_pick_confirm_download_without_download_fails_and_continues(
             "Timeout 30000ms exceeded while waiting for event 'download'"))
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "#dl", "action": "download", "columns": None}
         on_confirm(payload)
         return [payload]
@@ -177,7 +177,7 @@ def test_pick_full_flow_saves_recipe_and_cover(home_dir, tmp_path, monkeypatch,
         "headers": ["名称"], "data": [["商品1"], ["商品2"]]})  # 有表数据：执行成功才截封面
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "#data", "action": "table",
                    "columns": ["名称"], "rect": {"x": 1}}
         on_confirm(payload)
@@ -213,7 +213,7 @@ def test_pick_default_name_counts_existing_recipes(home_dir, tmp_path,
     monkeypatch.setattr("pageplay.picker.cover_screenshot",
                         lambda page, selector, out: out.write_bytes(b"png"))
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "#t", "action": "download", "columns": None}
         on_confirm(payload)
         return [payload]
@@ -237,7 +237,7 @@ def test_pick_cancelled_returns_one(home_dir, monkeypatch, capsys):
     _write_saved_site(home_dir, name="faketest")
     install_browser(monkeypatch, PickPage("https://x.example.com/1"))
 
-    def cancelled(page, on_confirm, repeat=False):
+    def cancelled(page, on_confirm, repeat=False, colnames=None):
         raise picker.PickCancelled("人按 Esc 取消了框选")
 
     monkeypatch.setattr("pageplay.picker.run_pick", cancelled)
@@ -261,7 +261,7 @@ def test_pick_zero_rows_fails_exit_one(home_dir, table_site, tmp_path,
     page = PickPage(table_site + "/table", table=_ZERO_TABLE)
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "#data", "action": "table",
                    "columns": ["名称"], "rect": {"x": 1}}
         on_confirm(payload)
@@ -293,7 +293,7 @@ def test_pick_zero_rows_session_continues_exit_one(
         "headers": ["名称"], "data": [["商品1"]]})
     install_browser(monkeypatch, page)
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         ok = {"selector": "#data", "action": "table",
               "columns": ["名称"], "rect": {"x": 1}}
         on_confirm(ok)
@@ -312,21 +312,22 @@ def test_pick_zero_rows_session_continues_exit_one(
     assert {e["status"] for e in entries} == {"ok", "fail"}  # 成功条照常 ok
 
 
-def test_pick_cards_confirm_extracts_cards_and_saves_recipe(
+def test_pick_list_confirm_extracts_list_and_saves_recipe(
         home_dir, table_site, tmp_path, monkeypatch, capsys):
-    """卡片确认（list_mode=cards + fields）当场走 extract_cards 出数据；
-    recipe 落盘带 list_mode/fields（run 重放分派靠它们）。"""
+    """列表确认（list_mode=list + record_selector/columns）当场走
+    listscan 出数据；recipe 落盘带契约键（run 重放分派靠它们）。"""
     _write_saved_site(home_dir, name="faketest")
     fake_home = fake_downloads_home(monkeypatch, tmp_path)
-    page = PickPage(table_site + "/table", cards=[
+    page = PickPage(table_site + "/table", list_rows=[
         {"订单号": f"TB900{i}"} for i in range(1, 7)])
     install_browser(monkeypatch, page)
-    fields = [{"label": "订单号", "rel": [{"tag": "div", "nth": 1}]}]
+    columns = [{"key": "order-no", "name": "订单号", "strip": None}]
 
-    def fake_run_pick(page, on_confirm, repeat=False):
+    def fake_run_pick(page, on_confirm, repeat=False, colnames=None):
         payload = {"selector": "div.list", "action": "table",
-                   "columns": None, "list_mode": "cards",
-                   "fields": fields, "rect": {"x": 1}}
+                   "columns": columns, "list_mode": "list",
+                   "record_selector": "div.list > div.card",
+                   "sub_sem": None, "download": None, "rect": {"x": 1}}
         on_confirm(payload)
         return [payload]
 
@@ -334,15 +335,17 @@ def test_pick_cards_confirm_extracts_cards_and_saves_recipe(
     monkeypatch.setattr("pageplay.picker.cover_screenshot",
                         lambda page, selector, out: out.write_bytes(b"png"))
 
-    assert main(["pick", "faketest", "--name", "cards-x"]) == 0
+    assert main(["pick", "faketest", "--name", "list-x"]) == 0
 
-    products = fake_home / "Downloads" / "pageplay" / "cards-x"
-    (csv_path,) = products.glob("cards-x-*.csv")
+    products = fake_home / "Downloads" / "pageplay" / "list-x"
+    (csv_path,) = products.glob("list-x-*.csv")
     lines = csv_path.read_bytes().decode("utf-8-sig").splitlines()
-    assert lines[0] == "订单号" and len(lines) == 7  # 表头 + 6 行卡片
+    assert lines[0] == "订单号" and len(lines) == 7  # 表头 + 6 行列表
     recipe = json.loads((home_dir / "sites" / "faketest" / "recipes"
-                         / "cards-x.json").read_text(encoding="utf-8"))
-    assert recipe["list_mode"] == "cards" and recipe["fields"] == fields
+                         / "list-x.json").read_text(encoding="utf-8"))
+    assert recipe["list_mode"] == "list"
+    assert recipe["record_selector"] == "div.list > div.card"
+    assert recipe["columns"] == columns
     (entry,) = load_runs(_runs_path())
     assert entry["status"] == "ok" and "6 行" in entry["detail"]
 

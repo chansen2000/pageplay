@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from . import actions, cli as _cli, flows, picker, recipes, recorder, runs, runner
+from . import actions, cli as _cli, flows, listscan, picker, recipes, recorder, runs, runner
 from .guard import RiskTriggered
 from .session import ensure_browser, ensure_headful_browser, ensure_logged_in
 
@@ -77,15 +77,24 @@ def _record_run(name: str, action: str, status: str, detail: str,
 def _execute_recipe(page, recipe: dict, out_dir: Path) -> tuple[int, list[Path]]:
     """按 recipe 在当前页执行一次动作，返回 (行数, 产物路径)。
 
-    table 按 list_mode 分派（cards → 抽卡片用 fields，缺省 → 抽表用
-    columns 过滤）→ CSV+JSON 落盘（文件名带时间戳）；download → 点击
-    下载落盘。异常向上抛，由调用方负责 ✗ 展示与落账。
+    table 按 list_mode 分派（list → listscan 引擎抽列表（record_selector
+    + sub_sem + columns，v0.10），缺省 → 语义表格用 columns 过滤）；
+    links → 抓框内链接落 CSV，download=true 再下载像文件的链接（§5）；
+    download → 点击下载落盘。异常向上抛，由调用方负责 ✗ 展示与落账。
     """
     out_dir = Path(out_dir)
+    if recipe["action"] == "links":
+        rows = actions.extract_links(page, recipe["record_selector"])
+        stem = f"{recipe['name']}-{datetime.now():%Y%m%d-%H%M%S}"
+        products = list(actions.save_table(rows, out_dir, stem=stem))
+        if recipe.get("download"):
+            products += actions.download_links(page, rows, out_dir)
+        return len(rows), products
     if recipe["action"] == "table":
-        if (recipe.get("list_mode") or "table") == "cards":
-            rows = actions.extract_cards(page, recipe["selector"],
-                                         recipe.get("fields") or [])
+        if (recipe.get("list_mode") or "table") == "list":
+            rows = actions.extract_list(page, recipe["record_selector"],
+                                        recipe.get("sub_sem"),
+                                        recipe.get("columns"))
         else:
             rows = actions.extract_table(page, recipe["selector"],
                                          recipe.get("columns"))
@@ -99,6 +108,8 @@ def _report_products(action: str, rows: int, products: list[Path]) -> str:
     items = "、".join(f"{p.resolve()}（{actions.file_size_str(p)}）" for p in products)
     if action == "table":
         return f"已生成：抓表 {rows} 行 → {items}"
+    if action == "links":
+        return f"已生成：抓链接 {rows} 行 → {items}"
     return f"已生成 {items}"
 
 
@@ -114,7 +125,9 @@ def _save_cover(page, result: dict, site_dir: Path, name: str) -> None:
 def _execute_and_record(page, name: str, action: str, selector: str,
                         columns, out_dir: Path, ledger_action: str | None = None,
                         list_mode: str | None = None,
-                        fields: list[dict] | None = None) -> tuple[list[Path] | None, str]:
+                        record_selector: str | None = None,
+                        sub_sem: str | None = None,
+                        download: bool | None = None) -> tuple[list[Path] | None, str]:
     """当场执行一次动作并落账（pick 确认执行与 record 收获执行共用）。
 
     执行 → 打印 ✓（产物绝对路径+大小）或 ✗（人话原因）→ 无论成败落账
@@ -124,7 +137,9 @@ def _execute_and_record(page, name: str, action: str, selector: str,
     失败返回 (None, 人话原因)（调用方据此决定截封面/计入退出码）。
     """
     recipe = {"name": name, "action": action, "selector": selector,
-              "columns": columns, "list_mode": list_mode, "fields": fields}
+              "columns": columns, "list_mode": list_mode,
+              "record_selector": record_selector, "sub_sem": sub_sem,
+              "download": download}
     try:
         rows, products = _execute_recipe(page, recipe, out_dir)
     except RiskTriggered:
@@ -147,10 +162,10 @@ def confirm_and_execute(page, site, site_dir: Path, name: str,
                         result: dict) -> str | None:
     """单条确认的完整闭环（pick 的 on_confirm 钩子本体，可逐条复用）。
 
-    存 recipe（含 list_mode/fields，卡片 recipe 重放靠它们分派）→ 当场
-    执行（✓/✗ + 落账）→ 成功顺手截封面。任何一步失败都不向上抛：单条
-    失败只打 ✗ 并记 fail 账，框选会话继续。成功返回 None；失败返回人话
-    原因（pick 会话据此识别 0 行计退出码）。
+    存 recipe（列表/链接 recipe 带 record_selector 等契约键，重放靠它们
+    分派）→ 当场执行（✓/✗ + 落账）→ 成功顺手截封面。任何一步失败都不
+    向上抛：单条失败只打 ✗ 并记 fail 账，框选会话继续。成功返回 None；
+    失败返回人话原因（pick 会话据此识别 0 行计退出码）。
     """
     print(f"已锁定 {result['action']}：{result['selector']}")
     try:
@@ -158,7 +173,9 @@ def confirm_and_execute(page, site, site_dir: Path, name: str,
                   "url": page.url, "action": result["action"],
                   "selector": result["selector"], "columns": result["columns"],
                   "list_mode": result.get("list_mode") or "table",
-                  "fields": result.get("fields"),
+                  "record_selector": result.get("record_selector"),
+                  "sub_sem": result.get("sub_sem"),
+                  "download": result.get("download"),
                   "screenshot": f"{name}.png"}
         recipes.save_recipe(site_dir, recipe)
     except Exception as exc:
@@ -166,10 +183,16 @@ def confirm_and_execute(page, site, site_dir: Path, name: str,
         print(f"✗ {detail}", file=sys.stderr)
         _record_run(name, str(result["action"]), "fail", detail, [])
         return detail
+    # C1 规则①写入：确认时对比 name vs auto_name，改过的记住（按站点）
+    try:
+        listscan.remember_colnames(site.name, result.get("columns") or [])
+    except Exception as exc:
+        log.warning("列名记忆写入失败：%s", exc)
     products, detail = _execute_and_record(
         page, name, recipe["action"], recipe["selector"], recipe["columns"],
         _default_out_dir(name), list_mode=recipe["list_mode"],
-        fields=recipe["fields"])
+        record_selector=recipe["record_selector"],
+        sub_sem=recipe["sub_sem"], download=recipe["download"])
     if products is None:
         return detail
     _save_cover(page, result, site_dir, name)
@@ -261,7 +284,8 @@ def _cmd_pick(args: argparse.Namespace) -> int:
         except Exception:
             ptitle = "（无标题）"  # 替身页面/内建页无 title：不挡框选
         print(f"框选已激活在标签页：{ptitle}（{page.url[:60]}）")
-        picker.run_pick(page, _handler, repeat=True)
+        picker.run_pick(page, _handler, repeat=True,
+                        colnames=listscan.load_colnames(site.name))
     except picker.PickCancelled as exc:
         print(f"已取消：{exc}")
         return 1
@@ -318,12 +342,20 @@ def _cmd_record(args: argparse.Namespace) -> int:
             print(f"已记步骤 {step['no']}：{step['kind']} {step['selector']}")
 
         def _on_harvest(step: dict) -> None:
+            try:
+                listscan.remember_colnames(site.name, step.get("columns") or [])
+            except Exception as exc:
+                log.warning("列名记忆写入失败：%s", exc)
             _execute_and_record(page, draft_name, str(step["kind"]),
-                                str(step["selector"]), step.get("columns"),
-                                draft_dir, list_mode=step.get("list_mode"),
-                                fields=step.get("fields"))
+                                str(step.get("selector") or ""),
+                                step.get("columns"), draft_dir,
+                                list_mode=step.get("list_mode"),
+                                record_selector=step.get("record_selector"),
+                                sub_sem=step.get("sub_sem"),
+                                download=step.get("download"))
 
-        steps = recorder.record_session(page, _on_step, _on_harvest)
+        steps = recorder.record_session(page, _on_step, _on_harvest,
+                                        colnames=listscan.load_colnames(site.name))
     except picker.PickCancelled as exc:
         print(f"已取消：{exc}")
         return 1
@@ -446,7 +478,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         detail = _goto_with_login_recovery(page, browser, site, recipe["url"])
         if detail is None:
             try:
-                page.wait_for_selector(recipe["selector"], timeout=15000)
+                page.wait_for_selector(recipe.get("selector")
+                                       or recipe.get("record_selector"),
+                                       timeout=15000)
             except PlaywrightTimeoutError:
                 detail = f"页面结构可能变了，请重新 pick {site.name}"
             else:

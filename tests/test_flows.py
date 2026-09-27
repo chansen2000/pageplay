@@ -128,7 +128,9 @@ class TestValidation:
                       _flow(steps=[{"kind": "goto"}, "not-a-dict"]))
 
     def test_valid_kinds_all_accepted(self, tmp_path) -> None:
-        steps = [{"kind": k} for k in VALID_KINDS]
+        steps = [dict({"kind": k},
+                      record_selector="div.list > div.item", download=False)
+                 if k == "links" else {"kind": k} for k in VALID_KINDS]
         save_flow(tmp_path / "sycm", _flow(steps=steps))
         loaded = load_flow(tmp_path / "sycm", "sycm-flow-1")
         assert [s["kind"] for s in loaded["steps"]] == list(VALID_KINDS)

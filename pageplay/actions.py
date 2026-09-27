@@ -1,9 +1,10 @@
-"""run 执行器：页面风控检查、表格/卡片提取、结果落盘、文件下载。
+"""run 执行器：页面风控检查、表格/列表/链接提取、结果落盘、文件下载。
 
 供 run 流程按任务书驱动：每拿到一页响应先过 check_page_risk，再按
-选择器抽表（语义表格）或抽卡片（div 卡片列表）、抽完即落盘，需要导出
-文件时走 download_element。本模块不持有会话状态——context 由调用方
-（session/run 层）提供。
+选择器抽表（语义表格）或抽列表（listscan 引擎，v0.10 设计 §3）或抓
+框内链接（§4），抽完即落盘；文件类产物走 download_element /
+download_links。本模块不持有会话状态——context 由调用方（session/run
+层）提供。
 """
 
 from __future__ import annotations
@@ -11,9 +12,13 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from pathlib import Path
+from urllib.parse import unquote
 
+from . import listscan as _listscan
 from .guard import Guard
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -49,39 +54,25 @@ _TABLE_JS = """
 """
 
 
-# 页面上下文执行的读卡片脚本：容器内按同签名(tag+首class)兄弟重算最大组
-# （≥3 条）为记录，逐条按各 field.rel（[{tag,nth}] 相对链，item 端在首）
-# 解析到文本宿主元素取 trim 文本。返回 [{label: 值}, ...]；无组返回 []。
-_CARDS_JS = """
-(el, fields) => {
-  let best = null;
-  for (const c of el.children) {
-    const g = Array.prototype.filter.call(el.children, s =>
-      s.tagName === c.tagName && s.classList[0] === c.classList[0]
-      && (s.textContent || "").trim());
-    if (g.length >= 3 && (!best || g.length > best.length)) best = g;
+# 页面上下文执行的抓链接脚本：框选容器内全部 a[href] → 行 {文字, 链接,
+# 下载属性}，按 href 去重（§4「只抓链接」）。
+_LINKS_JS = """
+(el) => {
+  const out = [], seen = new Set();
+  for (const a of el.querySelectorAll("a[href]")) {
+    const href = a.href || "";
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+    out.push({文字: (a.textContent || "").trim(), 链接: href,
+              下载属性: a.hasAttribute("download")});
   }
-  if (!best) return [];
-  return best.map(item => {
-    const row = {};
-    for (const f of fields) {
-      let n = item;
-      for (const step of (f.rel || [])) {
-        let k = 0, found = null;
-        for (const ch of n.children) {
-          if (ch.tagName.toLowerCase() === step.tag && ++k === step.nth) {
-            found = ch; break;
-          }
-        }
-        n = found;
-        if (!n) break;
-      }
-      row[f.label] = n ? (n.textContent || "").trim() : "";
-    }
-    return row;
-  });
+  return out;
 }
 """
+
+# 「像文件」的白名单扩展名（§5）；有 download 属性的链接无条件算数
+_FILE_EXTS = (".pdf", ".xls", ".xlsx", ".csv", ".zip",
+              ".doc", ".docx", ".jpg", ".png")
 
 
 def check_page_risk(text: str) -> None:
@@ -132,31 +123,97 @@ def extract_table(page, selector: str, columns: list[str] | None) -> list[dict]:
     return rows
 
 
-def extract_cards(page, list_selector: str, fields: list[dict]) -> list[dict]:
-    """在页面上下文读 selector 指向的卡片列表，返回 [{"字段": "值"}, ...]。
+def extract_list(page, record_selector: str, sub_sem: str | None,
+                 columns: list[dict] | None) -> list[dict]:
+    """在页面上下文按 spec 抽列表（list_mode=list，v0.10 设计 §3/§6）。
 
-    卡片列表 = div 等容器内一组同签名（同标签且首个 class 相同）兄弟
-    记录（≥3 条），典型如淘宝订单列表——非语义表格，extract_table 读
-    不到。fields 来自框选确认 payload（每项 {"label", "rel"}，rel 是
-    记录内定位文本宿主的 [{tag,nth}] 相对链）；键用 label（框选时取
-    文本前 8 字）。记录内某字段定位落空 → 该格填 ""（对齐 extract_table
-    缺列补空语义）。
-
-    fields 为空 → ValueError（至少勾选一个字段）；容器内识别不到同
-    签名记录组 → ValueError 人话（回页面重新框选）。
+    record_selector = 容器选择器 + " > " 记录级选择器（框选产出，不写
+    哈希 class）；columns 来自框选确认（[{key, name, strip}]，key 是
+    相对记录/子项的 sem 路径）；sub_sem 给定时每个子项一行、记录级字段
+    逐行重复。行抽取与框选预览共用 listscan 的同一份 JS 管线。columns
+    为空 → ValueError；0 行 → ValueError（不产空产物，同 extract_table
+    语义）。
     """
-    if not fields:
-        raise ValueError(
-            "fields 为空：卡片抓取至少要勾选一个字段"
-            "（fields=[{\"label\", \"rel\"}, ...]，来自框选确认 payload）")
-    rows = page.eval_on_selector(list_selector, _CARDS_JS, fields)
+    if not columns:
+        raise ValueError("没有勾选任何列：至少勾选一列才能抓取")
+    rows = _listscan.extract(page, {"record_selector": record_selector,
+                                    "sub_sem": sub_sem, "columns": columns})
     if not rows:
         raise ValueError(
-            f"选择器 {list_selector!r} 下未识别到卡片列表：容器内需要"
-            " ≥3 条同结构记录（同标签且首个 class 相同），请回页面重新框选")
-    logger.debug("extract_cards %s: %d 行 x %d 字段",
-                 list_selector, len(rows), len(fields))
+            f"{ZERO_ROWS_PREFIX}：选择器 {record_selector!r} 下没有可读"
+            "数据行（页面结构可能已变化，请回页面重新框选）")
+    logger.debug("extract_list %s: %d 行 x %d 列",
+                 record_selector, len(rows), len(columns))
     return rows
+
+
+def extract_links(page, record_selector: str) -> list[dict]:
+    """框选容器内全部 a[href] → 行 {文字, 链接, 下载属性}，按 href 去重。
+
+    选择器无匹配 → ValueError；0 条链接 → ValueError（不产空产物）。
+    """
+    rows = page.eval_on_selector(record_selector, _LINKS_JS)
+    if rows is None:
+        raise ValueError(
+            f"选择器 {record_selector!r} 在页面上没有匹配到元素："
+            "页面结构可能已变化，请回页面重新框选")
+    if not rows:
+        raise ValueError(
+            f"{ZERO_ROWS_PREFIX}：框内没有可读链接，请回页面重新框选")
+    logger.debug("extract_links %s: %d 条", record_selector, len(rows))
+    return rows
+
+
+def _file_like(url: str, has_attr: bool) -> bool:
+    """§5「像文件」判定：有 download 属性，或路径扩展名在白名单。"""
+    if has_attr:
+        return True
+    return urlsplit(url).path.lower().endswith(_FILE_EXTS)
+
+
+def _filename_from_disposition(resp) -> str | None:
+    """Content-Disposition 头里的 filename（含 filename* UTF-8 变体）。"""
+    disp = (resp.headers or {}).get("content-disposition") or ""
+    m = re.search(r"filename\*=UTF-8''([^;]+)", disp, re.I)
+    if m:
+        return unquote(m.group(1).strip("' "))
+    m = re.search(r'filename="?([^";]+)"?', disp, re.I)
+    return m.group(1).strip() if m else None
+
+
+def download_links(page, links: list[dict], out_dir: Path) -> list[Path]:
+    """把「像文件」的链接逐个下载到 out_dir，返回已落盘路径列表（§5）。
+
+    links 通常直接传 extract_links 的行（含 链接/下载属性 两键）。只下
+    「像文件」的链接（download 属性或白名单扩展名），其余跳过不报错；
+    逐个之间 Guard.wait 护栏限速；单个失败记一行 warning 不中断。
+    文件名优先 Content-Disposition，其次 URL 末段。用
+    page.context.request.get（带登录 cookie），不走页面点击。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    guard = Guard(curfew=None)  # 抓取流程不适用夜间禁跑（同 check_page_risk）
+    saved: list[Path] = []
+    for link in links:
+        url = str(link.get("链接") or link.get("url") or "")
+        if not url or not _file_like(url, bool(link.get("下载属性"))):
+            continue
+        try:
+            guard.wait()
+            resp = page.context.request.get(url)
+            if not resp.ok:
+                logger.warning("download_links: %s 返回 %s，跳过", url, resp.status)
+                continue
+            name = (_filename_from_disposition(resp)
+                    or unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+                    or f"file-{len(saved) + 1}")
+            target = out_dir / name
+            target.write_bytes(resp.body())
+            saved.append(target)
+            logger.info("download_links: %s 已保存 %s", url, target)
+        except Exception as exc:  # 单个失败不中断（§5）
+            logger.warning("download_links: %s 下载失败：%s", url, exc)
+    return saved
 
 
 def save_table(rows: list[dict], out_dir: Path, stem: str) -> tuple[Path, Path]:

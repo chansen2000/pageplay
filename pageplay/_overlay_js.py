@@ -1,32 +1,37 @@
-"""框选覆层注入 JS 资产（纯字符串模块，零 import）：picker.overlay_js() 返回它。
+"""框选覆层主 JS（与 _overlay_panel_js 的面板函数配套）：picker.overlay_js()
+把 PANEL_JS 拼进 /* __PANEL_JS__ */ 标记位后注入。
 
-注入 JS（IIFE）：hover 高亮 + 键盘扩收 + Esc 取消 + 点击锁定/列勾选。
-只 append 覆层（#__pageplay_overlay），不改页面业务 DOM；结束（确认/
-取消/清理）由 __pageplay_cleanup 移除全部覆层与监听。经 add_init_script
-注入时每个新文档自动布防；同文档内覆层被页面剥掉（SPA 软跳转/DOM 重建）
-由心跳自愈重新布防，全程幂等、单实例。
+交互（任务书 v2 B，逐条实现）：
+- 未锁定：hover 红框按候选层默认层显示（列表：N 条记录 · ↑↓ 换范围）；
+  ↑/↓ 在候选层间切换（↓ 内层 / ↑ 外层）；Esc 退出框选（oncancel）。
+- 已锁定：点页面别处（面板外）直接改选到新位置；Esc 或面板「重选」解锁
+  回未锁定态（会话不结束）；面板「退出」才结束（oncancel）；
+  Shift+点第二条按 §3.2 两点消歧（保持）。
+- 页面顶部居中提示条随状态切换文案（未锁定/已锁定）。
 
-独立成模块只为控制 picker.py 行数（v0.7 收口，红线 #26）：JS 是整块资产，
-拆走后 picker.py 只剩 python 逻辑。改 JS 必须同步对照 picker 里
-COLLECT_CHAIN_JS / selector_from_chain 的同规则实现（链序两端一致）。
+选层（任务书 v2 A）：hover/点击都走 window.__pp_groups（全部候选层，
+排除 body/html 容器）→ __pp_default（记录数最多，同数取内层）；
+__pp_scan 只接收已选层。覆层里 ↑↓ 与换层条在候选层间移动。
+
+只 append 覆层（#__pageplay_overlay），不改页面业务 DOM；经
+add_init_script 注入时每个新文档自动布防，覆层被页面剥掉（SPA 软跳转）
+由心跳自愈重新布防；全程幂等、单实例。
 """
 
 OVERLAY_JS = """
 (() => {
   if (window.__pageplay_cleanup) { try { window.__pageplay_cleanup(); } catch (e) {} }
 
-  // T20 语义收窄：只认 table/[role=grid]。ul/ol 不再被语义优先劫持——
-  // 语义容器锁中没有 tr 的列表 → extract_table 必然 0 行（真机两次踩坑）；
-  // ul 里的 li 卡片组改由 cardGroup 正常认领，走字段勾选路径（更有用）
   const SEM = "table,[role=grid]";
   const HB_MS = 800;  // 自愈心跳周期：覆层被剥后最迟一个周期重新布防
-  let current = null, curGroup = null;  // 高亮目标 / 其卡片组（null=非卡片模式）
-  let locked = null;    // 点击锁定后的目标
-  const upStack = [];   // ↑ 扩选记录（↓ 收回用）
-  let overlay = null, box = null, panel = null, lab = null;
-  let ac = null;        // 文档监听生命周期（abort = 监听已拆）
-  let hbTimer = 0;
-  let over = false;     // 会话结束（确认/取消/清理）：不再布防
+  let current = null, locked = null;
+  let hoverGroups = null, hoverIdx = -1, lastDefContainer = null;
+  let lockGroups = null, lockIdx = -1;
+  let curScan = null, curCols = null, firstPickEl = null;
+  let overlay = null, box = null, panel = null, lab = null, tip = null;
+  let ac = null, hbTimer = 0, over = false;
+  let lastScanContainer = null, lastScan = null, lastColnames = null;  // 扫描按容器+列名记忆缓存
+
 
   function semantic(el) {
     try { return (el && el.closest && el.closest(SEM)) || el; } catch (e) { return el; }
@@ -43,29 +48,32 @@ OVERLAY_JS = """
     box.style.height = r.h + "px";
     box.style.display = "block";
   }
-  function labelFor(el) {  // T20 红框标签：点击前就看清锁中的目标类型
-    if (curGroup && el === curGroup.box) {
-      // T21c：hover 阶段就按闸2 同口径判质量（pickFields 已含闸1 过滤，
-      // 单 item TreeWalker 微秒级，mousemove 高频可接受、不缓存）——
-      // 字段<2 的垃圾组不冒充"卡片列表"（真机淘宝首页：hover 报
-      // "卡片列表：4 条记录"，点击却被闸2 拦，标签误导）
-      if (pickFields(curGroup.items[0]).length < 2)
-        return "区域：未识别到列表结构";
-      return "卡片列表：" + curGroup.items.length + " 条记录";
-    }
+  function listLabel(scan) {  // 未锁定标签：列 <2 = 垃圾组，不冒充列表
+    if (!scan || !scan.columns || scan.columns.length < 2)
+      return "区域：未识别到列表结构";
+    return "列表：" + scan.n_records + " 条记录 · ↑↓ 换范围";
+  }
+  function labelFor(el) {
+    if (hoverGroups && el === hoverGroups[hoverIdx].container)
+      return listLabel(lastScan);
     try {
       if (el && el.matches && el.matches("table,[role=grid]"))
         return "表格：" + el.querySelectorAll("tr").length + " 行";
     } catch (e) {}
     return "元素（无表格结构，仅可下载）";
   }
-  function showBox(el) {  // 红框 + 类型标签一起走（标签挂 box 左上角上方）
+  function showBox(el) {
     moveBox(el);
     const r = rectOf(el);
     lab.textContent = labelFor(el);
     lab.style.left = r.x + "px";
     lab.style.top = Math.max(0, r.y - 22) + "px";
     lab.style.display = "block";
+  }
+  function setHint(isLocked) {  // 顶部提示条随状态切换文案
+    if (tip) tip.textContent = isLocked
+      ? "勾选要的列后点确认 · 点别处换位置 · Esc 重选"
+      : "点一下列表锁定 · ↑↓ 换范围 · Esc 退出";
   }
   function tagNth(n) {
     let k = 1, s = n;
@@ -99,45 +107,12 @@ OVERLAY_JS = """
     if (chain.length > 5) chain = chain.slice(chain.length - 5);
     return chain.map((l, i) => renderLink(l, i === 0)).join(" > ");
   }
-  function sameGroup(el) {  // 同 tag+首class 且含非空文本的兄弟组，≥3 才算卡片签名
-    if (!el || el.nodeType !== 1 || !el.parentElement) return null;
-    const c = el.classList[0];
-    const g = Array.prototype.filter.call(el.parentElement.children, s =>
-      s.tagName === el.tagName && s.classList[0] === c && (s.textContent || "").trim());
-    return g.length >= 3 ? g : null;
-  }
-  function cardGroup(el) {  // 自 el 向上取最大重复组 → {items, box:组父容器}；无则 null
-    let best = null;
-    for (let p = el; p && p.nodeType === 1; p = p.parentElement) {
-      const g = sameGroup(p);
-      if (g && (!best || g.length > best.items.length))
-        best = {items: g, box: p.parentElement};
-    }
-    return best;
-  }
-  function relFrom(item, node) {  // item→文本宿主相对链 [{tag,nth}]（item 端在首）
-    const c = [];
-    for (let n = node.parentElement; n && n !== item; n = n.parentElement)
-      c.unshift({tag: n.tagName.toLowerCase(), nth: tagNth(n)});
-    return c;
-  }
-  function pickFields(item) {  // 首条记录内文本节点 → 字段候选：≥2 字、相邻同文/同宿主去重
-    const out = [], w = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
-    let last = null, m;
-    while ((m = w.nextNode())) {
-      const host = m.parentElement;
-      // T21b 闸1（文本质量）：SCRIPT/STYLE/NOSCRIPT 里的文本是代码不是数据
-      // （真机淘宝首页 CSS 充字段的误报根源）→ 不进候选、不参与去重状态
-      if (host && /^(SCRIPT|STYLE|NOSCRIPT)$/.test(host.tagName)) continue;
-      const t = (m.textContent || "").trim();
-      if (t.length < 2 || (last && (t === last.t || host === last.el))) continue;
-      last = {t: t, el: host};
-      out.push({label: t.slice(0, 8) || "字段" + (out.length + 1), rel: relFrom(item, m)});
-    }
-    return out;
-  }
-  function buildUi() {  // 建覆层三件套并挂到 body（重建时同步重置拾取态）
-    current = null; locked = null; curGroup = null; upStack.length = 0;
+  function buildUi() {  // 覆层四件套（红框/面板/标签/提示条）挂 body
+    current = null; locked = null;
+    hoverGroups = null; hoverIdx = -1; lastDefContainer = null;
+    lockGroups = null; lockIdx = -1;
+    curScan = null; curCols = null; firstPickEl = null;
+    lastScanContainer = null; lastScan = null;
     overlay = document.createElement("div");
     overlay.id = "__pageplay_overlay";
     box = document.createElement("div");
@@ -154,28 +129,30 @@ OVERLAY_JS = """
       + "background:#fff;border:1px solid #ccc;border-radius:4px;padding:2px 8px;"
       + "font:12px/1.6 -apple-system,sans-serif;color:#222;white-space:nowrap;"
       + "box-shadow:0 2px 8px rgba(0,0,0,.12);";
+    tip = document.createElement("div");
+    tip.id = "__pageplay_hint";
+    tip.style.cssText = "position:fixed;top:0;left:50%;transform:translateX(-50%);"
+      + "z-index:2147483647;display:none;pointer-events:none;background:rgba(229,72,77,.92);"
+      + "color:#fff;border-radius:0 0 6px 6px;padding:4px 14px;"
+      + "font:13px/1.8 -apple-system,sans-serif;";
     overlay.appendChild(box);
     overlay.appendChild(panel);
     overlay.appendChild(lab);
+    overlay.appendChild(tip);
     (document.body || document.documentElement).appendChild(overlay);
+    setHint(false);
+    tip.style.display = "block";
   }
-  function alive() {  // 覆层四件套仍全部挂在文档里
-    return !!(overlay && box && panel && lab && overlay.isConnected
-      && box.isConnected && panel.isConnected && lab.isConnected);
+  function alive() {  // 覆层五件套仍全部挂在文档里
+    return !!(overlay && box && panel && lab && tip && overlay.isConnected
+      && box.isConnected && panel.isConnected && lab.isConnected && tip.isConnected);
   }
-  function confirmPick(action, columns, listMode, fields) {
+  function confirmPick(payload) {  // 统一确认出口：rect/url 在此附上
     if (!locked) return;
     over = true;  // 会话结束：停自愈，UI 留给 python 收尾移除
     clearInterval(hbTimer);
-    const payload = {
-      selector_hint: hint(locked),
-      action: action,
-      columns: columns,
-      list_mode: listMode || "table",  // 卡片组确认传 "cards"，其余恒 "table"
-      fields: fields || null,          // 仅卡片组带 [{label,rel}]，其余 null
-      rect: rectOf(locked),
-      url: location.href,  // 确认那一刻的落点（跨页框选时≠拾取起点页）
-    };
+    payload.rect = rectOf(locked);
+    payload.url = location.href;
     window.__pageplay_locked = locked;
     window.__pageplay_last_payload = payload;
     if (window.__pageplay_onconfirm) window.__pageplay_onconfirm(payload);
@@ -185,132 +162,113 @@ OVERLAY_JS = """
     disarm();
     if (overlay) overlay.remove();
   }
-  function cancelPick() {
+  function cancelPick() {  // 结束框选会话（未锁定 Esc / 面板「退出」）
     over = true;
     clearInterval(hbTimer);
     teardown();
     if (window.__pageplay_oncancel) window.__pageplay_oncancel();
   }
+  function unlock() {  // 解锁回未锁定态：面板收起，会话不结束
+    locked = null; lockGroups = null; lockIdx = -1;
+    curScan = null; curCols = null; firstPickEl = null;
+    panel.style.display = "none";
+    box.style.display = "none";
+    lab.style.display = "none";
+    setHint(false);
+  }
   window.__pageplay_cancel = cancelPick;
   window.__pageplay_cleanup = () => { over = true; clearInterval(hbTimer); teardown(); };
 
+  function scanFor(group) {  // 扫描按容器缓存（mousemove/↑↓ 高频）；
+    // 列名记忆更换时也失效（任务书 v2 C1 规则① 注入时机）
+    if (group.container !== lastScanContainer || lastColnames !== window.__pp_colnames) {
+      lastScanContainer = group.container;
+      lastColnames = window.__pp_colnames;
+      lastScan = window.__pp_scan(group);
+    }
+    return lastScan;
+  }
+  function hoverAt(el) {  // 候选层 + 当前层（↑↓ 的 hoverIdx 悬停期间保持）
+    if (!window.__pp_groups) return null;
+    const gs = window.__pp_groups(el);
+    if (!gs.length) { hoverGroups = null; lastDefContainer = null; return null; }
+    const def = window.__pp_default(gs);
+    if (!hoverGroups || def.container !== lastDefContainer) {
+      hoverGroups = gs;
+      hoverIdx = gs.indexOf(def);
+      lastDefContainer = def.container;
+    }
+    const g = hoverGroups[hoverIdx] || gs[hoverIdx] || gs[0];
+    return {group: g, groups: gs, idx: hoverGroups.indexOf(g), scan: scanFor(g)};
+  }
+  function applyList(groups, idx, scan, firstEl) {  // 锁定列表层 → 面板
+    locked = groups[idx].container;
+    lockGroups = groups; lockIdx = idx;
+    firstPickEl = firstEl || null;
+    curScan = scan || window.__pp_scan(groups[idx])
+      || {columns: [], sub_sem: null, n_records: groups[idx].records.length,
+          n_items: 0, sample_keys: [], record_selector: null};
+    curCols = (curScan.columns || []).map(c => ({
+      key: c.key, name: c.name, auto_name: c.auto_name, strip: c.strip || null,
+      sem: c.sem || "", renamed: !!c.renamed, checked: c.default_checked !== false,
+    }));
+    setHint(true);
+    renderListPanel();
+  }
   function onMove(e) {
     if (locked || overlay.contains(e.target)) return;
-    const sem = semantic(e.target);
-    curGroup = null;
-    if (sem !== e.target) current = sem;  // ① 语义容器优先（表格路径原样）
-    else {
-      const g = cardGroup(e.target);      // ② 次选：重复兄弟组，高亮其父容器
-      if (g) { curGroup = g; current = g.box; }
-      else current = sem;                 // ③ 兜底：元素自身
+    const semEl = semantic(e.target);
+    if (semEl !== e.target) {  // ① 语义容器优先（表格路径原样）
+      hoverGroups = null; current = semEl;
+    } else {
+      const h = hoverAt(e.target);  // ② 列表候选层（默认层；↑↓ 可换）
+      current = h ? h.group.container : semEl;  // ③ 兜底：元素自身
     }
     if (current) showBox(current);
   }
   function onClick(e) {
-    if (locked) return;  // 已锁定：后续点击还给页面/面板
-    if (overlay.contains(e.target)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    locked = current || semantic(e.target);
-    showBox(locked);  // 锁定后标签保留（T20：锁定态类型仍可见）
-    if (locked.matches("table,[role=grid]")) renderColumnBar(locked);
-    else if (curGroup && locked === curGroup.box) renderFieldBar(curGroup);
-    else renderActionPanel();
+    if (overlay.contains(e.target)) return;  // 面板内点击还给面板
+    if (locked && e.shiftKey && firstPickEl) {  // §3.2 两点消歧（保持）
+      const g2 = window.__pp_group2(firstPickEl, e.target);
+      if (g2 && g2.records.length >= 2) applyList([g2], 0, window.__pp_scan(g2), e.target);
+      return;
+    }
+    firstPickEl = e.target;  // 已锁定再点 = 直接换选（不经取消）
+    const semEl = semantic(e.target);
+    if (semEl !== e.target) {  // 语义表格（原样）
+      locked = semEl;
+      lastScanContainer = null; lastScan = null;
+      renderColumnBar(locked);
+    } else {
+      const h = hoverAt(e.target);
+      if (h) applyList(h.groups, h.idx, h.scan, e.target);
+      else { locked = semEl || e.target; renderActionPanel(); }
+    }
+    setHint(true);
+    showBox(locked);
   }
   function onKey(e) {
-    if (e.key === "Escape") { e.preventDefault(); cancelPick(); return; }
-    if (locked) return;  // 锁定后 ↑↓ 不再改目标
-    if (e.key === "ArrowUp") {
-      const p = current && current.parentElement;
-      if (p) { upStack.push(current); current = p; curGroup = null;
-               showBox(p); e.preventDefault(); }
-    } else if (e.key === "ArrowDown") {
-      if (upStack.length) { current = upStack.pop(); curGroup = null;
-                            showBox(current); e.preventDefault(); }
+    if (e.key === "Escape") {
+      const ae = document.activeElement;
+      if (ae && ae.tagName === "INPUT") return;  // 改名输入框里 Esc 只退输入
+      e.preventDefault();
+      if (locked) unlock();  // 已锁定：解锁重选，会话不结束
+      else cancelPick();     // 未锁定：退出框选
+      return;
     }
-  }
-  function btn(label) {
-    const b = document.createElement("button");
-    b.textContent = label;
-    b.style.cssText = "margin:2px 4px 2px 0;padding:3px 10px;cursor:pointer;";
-    return b;
-  }
-  function readHeaders(t) {
-    let cells = t.querySelectorAll("thead th");
-    if (!cells.length) cells = t.querySelectorAll("tr:first-child th");
-    if (!cells.length) cells = t.querySelectorAll("tr:first-child td");
-    return Array.prototype.map.call(cells, c => (c.textContent || "").trim());
-  }
-  function checkList(labels) {  // 勾选条公共件：label 列表 → 默认全勾的 checkbox 列表
-    return labels.map(text => {
-      const lab = document.createElement("label"), cb = document.createElement("input");
-      lab.style.cssText = "display:block;";
-      cb.type = "checkbox"; cb.checked = true;
-      lab.appendChild(cb); lab.appendChild(document.createTextNode(text || "(未命名列)"));
-      panel.appendChild(lab);
-      return cb;
-    });
-  }
-  function renderColumnBar(t) {
-    panel.textContent = "";
-    const title = document.createElement("div");
-    title.textContent = "已锁定表格，选择要抓取的列：";
-    panel.appendChild(title);
-    const cols = readHeaders(t);
-    const ok = btn("确认");
-    if (!cols.length) {  // T20 防呆：无表格行 → 读不到列，确认置灰拦住
-      const warn = document.createElement("div");
-      warn.textContent = "该目标读不到列（无表格行），按 Esc 换目标";
-      warn.style.cssText = "color:#e5484d;";
-      panel.appendChild(warn);
-      ok.disabled = true;
-      ok.style.opacity = "0.5";
-    } else {
-      const boxes = checkList(cols);
-      ok.onclick = () => confirmPick("table", cols.filter((c, i) => boxes[i].checked));
+    if (locked) return;  // 锁定后换层走面板/换选，↑↓ 不再改目标
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {  // 候选层切换
+      if (!hoverGroups || !hoverGroups.length) return;
+      const next = e.key === "ArrowUp" ? hoverIdx + 1 : hoverIdx - 1;
+      if (next < 0 || next >= hoverGroups.length) return;  // 到边不动
+      hoverIdx = next;
+      const g = hoverGroups[hoverIdx];
+      current = g.container;
+      scanFor(g);  // 换层即重扫（缓存按容器，标签/列用新层）
+      showBox(current);  // 红框和标签实时更新
+      e.preventDefault();
+      return;
     }
-    panel.appendChild(ok);
-    panel.style.display = "block";
-  }
-  function renderFieldBar(g) {  // 卡片组锁定：识别到 N 条记录 + 字段勾选（确认=抓卡片）
-    panel.textContent = "";
-    const fields = pickFields(g.items[0]);
-    if (fields.length < 2) {  // T21b 闸2（结构门槛）：有效字段<2=垃圾组（同签名
-      const note = document.createElement("div");  // 兄弟但无重复数据结构），不给
-      note.textContent = "未识别到有效的重复数据结构";  // 勾选/确认入口，同"无表格结构"
-      note.style.cssText = "color:#888;font-size:12px;";
-      panel.appendChild(note);
-      const dl = btn("下载此元素");
-      dl.onclick = () => confirmPick("download", null);
-      panel.appendChild(dl);
-    } else {
-      const title = document.createElement("div");
-      title.textContent = "识别到 " + g.items.length + " 条记录，选择要抓取的字段：";
-      panel.appendChild(title);
-      const boxes = checkList(fields.map(f => f.label));
-      const ok = btn("确认");
-      ok.onclick = () => confirmPick("table", null, "cards",
-        fields.filter((f, i) => boxes[i].checked));
-      panel.appendChild(ok);
-    }
-    panel.style.display = "block";
-  }
-  function renderActionPanel() {
-    panel.textContent = "";
-    const dl = btn("下载此元素");
-    dl.onclick = () => confirmPick("download", null);
-    panel.appendChild(dl);
-    if (locked.querySelectorAll("tr").length) {  // 有表格行才提供抓表
-      const tb = btn("抓取此表");
-      tb.onclick = () => confirmPick("table", null);
-      panel.appendChild(tb);
-    } else {  // T20 防呆：无 tr 抓表必 0 行，明说不可抓，不给假入口
-      const note = document.createElement("div");
-      note.textContent = "该元素无表格结构，不可抓表";
-      note.style.cssText = "color:#888;font-size:12px;";
-      panel.appendChild(note);
-    }
-    panel.style.display = "block";
   }
   function arm() {  // 文档级监听（AbortController 一把拆），已布防则跳过
     if (ac && !ac.signal.aborted) return;
@@ -334,5 +292,7 @@ OVERLAY_JS = """
     deploy();
   }
   hbTimer = setInterval(deploy, HB_MS);
+
+/* __PANEL_JS__ */
 })();
 """

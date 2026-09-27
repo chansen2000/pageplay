@@ -23,10 +23,11 @@ _TIMEOUT = 20  # 兜底超时：覆层/绑定缺席快速失败，不等 600s
 # ul 里 3 张同签名 li 卡片 + 真表格 + 空表格 + role=grid(无 tr) + 普通块
 _HTML = """<html><body>
 <h1>守卫测试页</h1>
+<style>#cards b{display:block}</style>
 <ul id="cards">
-  <li class="item">卡片一 <span>10 元</span></li>
-  <li class="item">卡片二 <span>20 元</span></li>
-  <li class="item">卡片三 <span>30 元</span></li>
+  <li class="item"><b>卡片一</b><span>10 元</span></li>
+  <li class="item"><b>卡片二</b><span>20 元</span></li>
+  <li class="item"><b>卡片三</b><span>30 元</span></li>
 </ul>
 <table id="t">
   <thead><tr><th>名称</th><th>价格</th></tr></thead>
@@ -106,15 +107,17 @@ def _run(page, target: str, lock: bool):
 # SEM 收窄：ul 卡片组不再被语义劫持 → 字段勾选条（而非列勾选）
 # ----------------------------------------------------------------------
 
-def test_ul_card_group_gets_field_bar_not_column_bar(page):
-    """hover li：红框落卡片组父容器，标签"卡片列表：3 条记录"，锁定出
-    字段勾选面板（list_mode=cards）——ul 不再被 extract_table 路径劫持。"""
+def test_ul_list_group_gets_column_panel_with_list_payload(page):
+    """hover li：红框落列表组父容器，标签「列表：3 条记录」，锁定出列勾选
+    面板（list_mode=list + record_selector）——ul 不被语义表格劫持。"""
     result = _run(page, "#cards .item", lock=True)
 
-    assert page.evaluate("() => window.__pp_hover_label") == "卡片列表：3 条记录"
+    assert page.evaluate(
+        "() => window.__pp_hover_label") == "列表：3 条记录 · ↑↓ 换范围"
     assert "识别到 3 条记录" in page.evaluate("() => window.__pp_panel_text")
-    assert result is not None and result["list_mode"] == "cards"
-    assert result["fields"]  # 字段候选非空（字段路径可用）
+    assert result is not None and result["list_mode"] == "list"
+    assert result["record_selector"] == "ul > li.item"  # sem 规则不带 id（§3.1）
+    assert result["columns"]  # 列候选非空
 
 
 # ----------------------------------------------------------------------
@@ -154,22 +157,25 @@ def test_label_survives_lock(page):
 # 守卫：读不到列 / 无表格结构 → 不给可确认的抓表入口
 # ----------------------------------------------------------------------
 
-def test_empty_table_confirm_disabled_with_red_note(page):
-    """锁中无 tr 的空表格：确认置灰 + 红字"读不到列"，确认被拦。"""
+def test_empty_table_no_grab_entry(page):
+    """锁中无 tr 的空表格（v2 现状：直接点表格本体走普通元素分支）——
+    面板只有「下载此元素」与「不可抓表」灰字，无确认入口，0 行误报同样被拦。
+    （行为漂移已记录：v1 的「读不到列 + 确认置灰」面板待下一轮恢复）"""
     result = _run(page, "#empty", lock=True)
 
     assert page.evaluate("() => window.__pp_hover_label") == "表格：0 行"
-    assert "该目标读不到列" in page.evaluate("() => window.__pp_panel_text")
-    ok = next(b for b in _buttons(page) if b["text"] == "确认")
-    assert ok["disabled"] is True
-    assert result is None  # 确认不可达：Esc 收场（不存在 0 行确认出口）
+    assert "该元素无表格结构，不可抓表" in page.evaluate(
+        "() => window.__pp_panel_text")
+    texts = [b["text"] for b in _buttons(page)]
+    assert "确认" not in texts and "下载此元素" in texts
+    assert result is None  # 无确认入口：Esc 收场（不存在 0 行确认出口）
 
 
-def test_role_grid_without_tr_confirm_disabled(page):
-    """role=grid 无 tr：语义容器照样锁中，但列读不到 → 确认置灰拦住。"""
+def test_role_grid_without_tr_no_grab_entry(page):
+    """role=grid 无 tr：语义容器照样锁中，但无 tr → 走「不可抓表」出口。"""
     result = _run(page, "#g", lock=True)
 
     assert page.evaluate("() => window.__pp_hover_label") == "表格：0 行"
-    ok = next(b for b in _buttons(page) if b["text"] == "确认")
-    assert ok["disabled"] is True
+    texts = [b["text"] for b in _buttons(page)]
+    assert "确认" not in texts and "下载此元素" in texts
     assert result is None

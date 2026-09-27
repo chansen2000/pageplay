@@ -16,8 +16,11 @@ flow 结构（设计 §12，flows.py 数据层落盘）：{"name", "site", "url"
   实现，避免 runner 反向依赖 CLI 层（T11d 会从 cli 侧调进来，顶层
   互相 import 会成环）。
 - click：等选择器（15s）→ 点击 → 等 1s 稳定。
-- table：等选择器 → 按 list_mode 分派 extract_table（缺省）/
-  extract_cards（"cards"，用 step["fields"]）→ save_table，产物名 <stem>-<no>。
+- table：等选择器 → 按 list_mode 分派 extract_table（缺省，语义表格）/
+  extract_list（"list"，record_selector + sub_sem + columns，v0.10）→
+  save_table，产物名 <stem>-<no>。
+- links：等 record_selector → 抓框内链接 {文字,链接} 落盘（§4）；
+  download=true 时再对「像文件」的链接逐个下载（§5）。
 - download：等选择器 → download_element 落盘。
 每步后 check_page_risk：命中且不在登录页 → RiskTriggered 向上抛
 （真风控照旧停机，退出码语义归调用方）；命中但落在登录页 = 中途被
@@ -134,30 +137,40 @@ def _run_step(page, browser, flow: dict, step: dict, out_dir: Path,
             raise _StepFailed(detail)
         return f"已打开 {page.url}"
 
-    selector = str(step["selector"])
+    selector = str(step.get("selector") or step.get("record_selector") or "")
     page.wait_for_selector(selector, timeout=SELECTOR_TIMEOUT_MS)
     if kind == "click":
         page.click(selector)
         time.sleep(1.0)  # 等点击跳转/渲染稳定，下一步在落点上继续
         detail = f"已点击 {selector}，落点 {page.url}"
     elif kind == "table":
-        if str(step.get("list_mode") or "table") == "cards":  # v0.7-A 卡片列表
-            rows = actions.extract_cards(page, selector,
-                                         step.get("fields") or [])
-            what = "抓卡片"
+        if str(step.get("list_mode") or "table") == "list":  # v0.10 列表
+            rows = actions.extract_list(page, str(step["record_selector"]),
+                                        step.get("sub_sem"),
+                                        step.get("columns"))
+            what = "抓列表"
         else:
             rows = actions.extract_table(page, selector, step.get("columns"))
             what = "抓表"
         csv_path, json_path = actions.save_table(
             rows, out_dir, stem=f"{flow_stem}-{step['no']}")
         detail = f"已生成：{what} {len(rows)} 行 → {csv_path}、{json_path}"
+    elif kind == "links":  # v0.10 抓链接（§4/§5）
+        rows = actions.extract_links(page, str(step["record_selector"]))
+        csv_path, json_path = actions.save_table(
+            rows, out_dir, stem=f"{flow_stem}-{step['no']}")
+        saved = (actions.download_links(page, rows, out_dir)
+                 if step.get("download") else [])
+        detail = (f"已生成：抓链接 {len(rows)} 行 → {csv_path}"
+                  + (f"；已下载 {len(saved)} 个文件" if step.get("download")
+                     else ""))
     elif kind == "download":
         target = actions.download_element(page, selector, out_dir)
         detail = (f"已生成 {target.resolve()}"
                   f"（{actions.file_size_str(target)}）")
     else:
         raise _StepFailed(f"第 {step['no']} 步动作类型不认识：{kind!r}"
-                          "（只支持 goto/click/table/download）")
+                          "（只支持 goto/click/table/download/links）")
 
     # 每步后风控检查（照旧语义）：命中且不在登录页 → 真风控上抛；
     # 命中但落在登录页 = 流程中途被弹回，按该步失败回报

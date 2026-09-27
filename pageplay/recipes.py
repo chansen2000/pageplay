@@ -9,8 +9,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-REQUIRED_FIELDS = ("version", "name", "site", "url", "action", "selector")
-_ACTIONS = ("download", "table")
+REQUIRED_FIELDS = ("version", "name", "site", "url", "action")
+_SELECTOR_ACTIONS = ("download", "table")  # 这些 action 用 selector 定位
+_ACTIONS = ("download", "table", "links")  # links 用 record_selector（§6）
 _LIST_KEYS = ("name", "action", "url", "created_at")
 _RECIPES_DIRNAME = "recipes"
 
@@ -34,7 +35,9 @@ def save_recipe(site_dir: Path, recipe: dict) -> Path:
     """校验并把 recipe 落成 <site_dir>/recipes/<name>.json，返回文件路径。
 
     - REQUIRED_FIELDS 任一缺失/为 None/空白串 → ValueError（消息点名缺哪些）
-    - action 只认 download / table，其他 → ValueError
+    - action 只认 download / table / links，其他 → ValueError；download/
+      table 必须带非空 selector，links 必须带非空 record_selector + 布尔
+      download（§6）
     - 写入自动带 created_at（ISO 秒级）；recipe 已带则原样保留
     - 同名 recipe 直接覆盖（log.info 一句），不做多版本并存
     """
@@ -48,6 +51,14 @@ def save_recipe(site_dir: Path, recipe: dict) -> Path:
     if recipe["action"] not in _ACTIONS:
         raise ValueError(
             f"非法 action：{recipe['action']!r}；只支持 {' / '.join(_ACTIONS)}")
+    if recipe["action"] in _SELECTOR_ACTIONS and not str(recipe.get("selector") or "").strip():
+        raise ValueError(
+            f"action={recipe['action']} 的 recipe 必须带非空 selector")
+    if recipe["action"] == "links":
+        if not str(recipe.get("record_selector") or "").strip():
+            raise ValueError("action=links 的 recipe 必须带非空 record_selector（§6）")
+        if not isinstance(recipe.get("download"), bool):
+            raise ValueError("action=links 的 recipe 必须带布尔 download（§6）")
 
     path = _recipe_path(site_dir, recipe["name"])
     payload = dict(recipe)

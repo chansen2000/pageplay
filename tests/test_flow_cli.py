@@ -69,7 +69,7 @@ def test_record_saves_flow_and_executes_harvest(home_dir, tmp_path,
     install_browser(monkeypatch, page)
     draft_dir = fake_home / "Downloads" / "pageplay" / "faketest-flow" / "record"
 
-    def fake_record_session(p, on_step, on_harvest):
+    def fake_record_session(p, on_step, on_harvest, colnames=None):
         assert p is page
         on_step(_CLICK_STEP)
         on_harvest(_HARVEST_STEP)  # 框选确认 → 当场执行
@@ -103,7 +103,7 @@ def test_record_enter_uses_next_flow_name_and_name_flag_skips_prompt(
     page = RecordPage(_START, table=_TABLE)
     install_browser(monkeypatch, page)
     monkeypatch.setattr("pageplay.recorder.record_session",
-                        lambda p, s, h: [dict(_CLICK_STEP)])
+                        lambda p, s, h, colnames=None: [dict(_CLICK_STEP)])
 
     def no_input(*a):  # --name 给定时不应再问
         raise AssertionError("不该问流程名")
@@ -125,7 +125,7 @@ def test_record_no_steps_and_cancelled_exit_one(home_dir, tmp_path,
     fake_downloads_home(monkeypatch, tmp_path)
     page = RecordPage(_START, table=_TABLE)
     install_browser(monkeypatch, page)
-    monkeypatch.setattr("pageplay.recorder.record_session", lambda p, s, h: [])
+    monkeypatch.setattr("pageplay.recorder.record_session", lambda p, s, h, colnames=None: [])
     assert main(["record", "faketest"]) == 1
     assert "未记录任何操作" in capsys.readouterr().out
 
@@ -138,7 +138,7 @@ def test_record_zero_row_harvest_fails_and_session_continues(
     page = RecordPage(_START, table={"headers": ["名称"], "data": []})
     install_browser(monkeypatch, page)
 
-    def fake_record_session(p, on_step, on_harvest):
+    def fake_record_session(p, on_step, on_harvest, colnames=None):
         on_harvest({"no": 1, "kind": "table", "url": _START,
                     "selector": "#t1", "columns": ["名称"], "note": ""})
         p.table = {"headers": ["名称"], "data": [["商品1"]]}  # 下一条有数据
@@ -164,7 +164,7 @@ def test_record_zero_row_harvest_fails_and_session_continues(
     assert "提取到 0 行" in captured.err
     assert "流程已保存：zr-flow" in captured.out
 
-    def cancelled(p, s, h):
+    def cancelled(p, s, h, colnames=None):
         raise PickCancelled("人 Ctrl-C 结束了录制")
 
     monkeypatch.setattr("pageplay.recorder.record_session", cancelled)
@@ -182,7 +182,7 @@ def test_record_goto_bounce_reports_and_closes_page(home_dir, tmp_path,
     monkeypatch.setattr("pageplay.cli_pick._goto_with_login_recovery",
                         lambda *a, **k: "登录态失效/被弹回登录页，请重跑本命令")
     monkeypatch.setattr("pageplay.recorder.record_session",
-                        lambda p, s, h: [_CLICK_STEP])
+                        lambda p, s, h, colnames=None: [_CLICK_STEP])
 
     assert main(["record", "faketest"]) == 1
 
@@ -206,7 +206,7 @@ def test_record_prompt_error_autosaves_with_default_name(
     page = RecordPage(_START, table=_TABLE)
     install_browser(monkeypatch, page)
 
-    def fake_record_session(p, on_step, on_harvest):
+    def fake_record_session(p, on_step, on_harvest, colnames=None):
         on_step(_CLICK_STEP)
         return [dict(_CLICK_STEP), dict(_HARVEST_STEP)]
     monkeypatch.setattr("pageplay.recorder.record_session",
@@ -420,7 +420,7 @@ def test_record_prints_step_card_on_start(home_dir, tmp_path, monkeypatch, capsy
     fake_downloads_home(monkeypatch, tmp_path)
     page = RecordPage(_START, table=_TABLE)
     install_browser(monkeypatch, page)
-    monkeypatch.setattr("pageplay.recorder.record_session", lambda p, s, h: [])
+    monkeypatch.setattr("pageplay.recorder.record_session", lambda p, s, h, colnames=None: [])
     assert main(["record", "faketest"]) == 1
     out = capsys.readouterr().out
     assert "── 录制步骤 ──" in out

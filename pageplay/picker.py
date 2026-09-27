@@ -1,12 +1,14 @@
 """框选层：人在页面上圈表格/元素，产出正式 CSS 选择器与动作载荷。
 
-流程（T7c 任务书契约）：run_pick 用 add_init_script 注入 overlay_js
-（hover 高亮 + ↑ 扩选 / ↓ 收回 + Esc 取消 + 点击锁定；div 卡片列表按
-"同签名兄弟 ≥3" 整组锁定，勾字段出 list_mode=cards 载荷）——每个新文档
-加载时自动布防（跨页存活），当前已加载文档再补一次 evaluate；人确认
-后 JS 调 window.__pageplay_onconfirm（expose_function 绑定跨文档持续
-有效）→ python 收 payload → 用 COLLECT_CHAIN_JS 收集锁定元素到根的
-链 → selector_from_chain 生成正式 selector → 组装并回调 on_confirm。
+流程（T7c 任务书契约 + v0.10 列表）：run_pick 用 add_init_script 注入
+listscan 引擎（_listscan_js）与 overlay_js（hover 高亮 + ↑ 扩选 / ↓ 收回
++ Esc 取消 + 点击锁定；重复记录组整组锁定，勾列出 list_mode=list 载荷
+（record_selector/sub_sem/columns），「只抓链接」出 action=links）——
+每个新文档加载时自动布防（跨页存活），当前已加载文档再补一次 evaluate；
+人确认后 JS 调 window.__pageplay_onconfirm（expose_function 绑定跨文档
+持续有效）→ python 收 payload → 用 COLLECT_CHAIN_JS 收集锁定元素到根的
+链 → selector_from_chain 生成正式 selector（普通元素/表格路径用）→
+组装并回调 on_confirm。
 覆层 JS 自带心跳自愈（同文档内 SPA 剥 DOM/软跳转后自动重新布防）。
 全程不改页面业务 DOM（只 append 覆层/面板，结束移除）。repeat=True
 转会话常驻（T9a）：确认后清场重布防连续框选，人关窗 / Ctrl-C 才结束。
@@ -17,12 +19,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from pathlib import Path
 
+from ._listscan_js import LISTSCAN_JS
 from ._overlay_js import OVERLAY_JS
+from ._overlay_panel_js import PANEL_JS
 
 log = logging.getLogger(__name__)
 
@@ -105,8 +110,12 @@ def selector_from_chain(chain: list[dict]) -> str:
 
 
 def overlay_js() -> str:
-    """返回注入 JS（IIFE，资产在 _overlay_js.OVERLAY_JS；契约见模块 docstring）。"""
-    return OVERLAY_JS
+    """拼接覆层主 JS 与面板 JS（_overlay_panel_js.PANEL_JS 填进标记位）。
+
+    两份都是闭包内裸函数/状态，拼接后才是一个完整 IIFE；契约见
+    _overlay_js 模块 docstring（任务书 v2 B 的文件拆分要求）。
+    """
+    return OVERLAY_JS.replace("/* __PANEL_JS__ */", PANEL_JS)
 
 
 class PickCancelled(RuntimeError):
@@ -156,12 +165,14 @@ def _rearm(page) -> None:
     wait_for_timeout 会如实按"页面已关闭"收尾。
     """
     try:
+        page.evaluate(LISTSCAN_JS)  # 列表引擎与覆层一起重新布防
         page.evaluate(overlay_js())
     except Exception:
         pass
 
 
-def run_pick(page, on_confirm, repeat: bool = False) -> dict | list[dict]:
+def run_pick(page, on_confirm, repeat: bool = False,
+             colnames: dict | None = None) -> dict | list[dict]:
     """注入框选覆层等人确认，组装结果并回调 on_confirm。
 
     流程：add_init_script(overlay_js)——每个新文档加载时自动布防（跨页
@@ -169,9 +180,11 @@ def run_pick(page, on_confirm, repeat: bool = False) -> dict | list[dict]:
     init script 不覆盖已加载页）→ 等待 JS 调 __pageplay_onconfirm（经
     expose 绑定收 payload，跨文档持续有效）→ page.evaluate
     (COLLECT_CHAIN_JS) 收集锁定元素到根的链 → selector_from_chain 生成
-    正式 selector → 组装 {"selector","action","columns","list_mode",
-    "fields","rect","url"}（卡片组确认时 list_mode="cards" + fields，
-    selector 指向组父容器）→ 调 on_confirm(结果)（cli 落盘/确认打印钩子）。
+    正式 selector（普通元素/表格路径用）→ 组装 {"selector","action",
+    "columns","list_mode","record_selector","sub_sem","download","rect",
+    "url"}（列表确认时 list_mode="list"，action=links 带
+    record_selector/download）→ 调 on_confirm(结果)（cli 落盘/确认打印
+    钩子）。
 
     repeat=False（默认，T7c 行为不变）：一次确认 → 返回该条 dict；
     Esc / 窗口关闭 / 超时无人确认 raise PickCancelled（超时自进入拾取
@@ -200,8 +213,14 @@ def run_pick(page, on_confirm, repeat: bool = False) -> dict | list[dict]:
     _ensure_bindings(page)
     results: list[dict] = []
     try:
+        page.add_init_script(LISTSCAN_JS)   # 列表引擎：新文档自动布防
         page.add_init_script(overlay_js())  # 新文档自动布防（跨页存活）
-        page.evaluate(overlay_js())         # 当前文档补注入（幂等）
+        page.evaluate(LISTSCAN_JS)          # 当前文档补注入（幂等）
+        page.evaluate(overlay_js())
+        if colnames:  # C1 规则①：本站记住的列名随覆层注入（新文档也生效）
+            payload = json.dumps(colnames, ensure_ascii=False)
+            page.add_init_script(f"window.__pp_colnames = {payload};")
+            page.evaluate(f"window.__pp_colnames = {payload};")
         deadline = time.monotonic() + _PICK_TIMEOUT_SEC
         while True:
             # 内层循环 = 等一条确认（repeat 的外层会话在 while True）
@@ -240,7 +259,9 @@ def run_pick(page, on_confirm, repeat: bool = False) -> dict | list[dict]:
                 "action": payload.get("action"),
                 "columns": payload.get("columns"),
                 "list_mode": payload.get("list_mode") or "table",
-                "fields": payload.get("fields"),  # 卡片组: [{label, rel}]；其余 None
+                "record_selector": payload.get("record_selector"),
+                "sub_sem": payload.get("sub_sem"),
+                "download": payload.get("download"),
                 "rect": payload.get("rect"),
                 "url": payload.get("url") or page.url,
             }

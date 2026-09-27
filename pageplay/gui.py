@@ -181,7 +181,6 @@ class App:
         row_a.pack(fill="x", pady=(2, 0))
         add_button(row_a, "打开窗口", "open")
         add_button(row_a, "③ 取当前页", "grab")
-        add_button(row_a, "视觉抓取", "vision")
         add_button(row_a, "② 录制", "record")
         add_button(row_a, "④ 重放", "run")
         row_b = ttk.Frame(step2)

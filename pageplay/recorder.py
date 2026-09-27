@@ -282,13 +282,15 @@ def _resume_browse(page) -> bool:
         return False
 
 
-def _enter_pick(page, steps: list[dict], on_harvest) -> None:
+def _enter_pick(page, steps: list[dict], on_harvest,
+                colnames: dict | None = None) -> None:
     """P 进框选子模式：picker.run_pick 单条模式（现有契约，picker.py 不动）。
 
-    on_harvest 收到与 on_step 同构的流程步骤 dict（kind=table/download，
-    框选 payload 的 action 折进 kind）。卡片组确认（list_mode=cards）把
-    list_mode/fields 原样透进步 dict（runner 靠它们走 extract_cards，
-    缺了重放必坏）；纯表格步不带这两键（向后兼容，v0.7 收口）。
+    on_harvest 收到与 on_step 同构的流程步骤 dict（kind=table/links/
+    download，框选 payload 的 action 折进 kind）。列表确认（v0.10，
+    list_mode=list）把 record_selector/sub_sem/columns 原样透进步 dict；
+    links 确认把 record_selector/download 透传（runner 靠它们重放，缺了
+    必坏）；纯语义表格步只带 selector+columns。
     Esc/超时 raise PickCancelled：
     页面还活着 → 回浏览模式继续录（不刷新空闲时限，Esc/超时不算进展）；
     页面已关 → 向上抛给主循环按关窗语义收尾。on_harvest 抛异常不吞、
@@ -304,14 +306,18 @@ def _enter_pick(page, steps: list[dict], on_harvest) -> None:
             "columns": result.get("columns"),
             "note": "",
         }
-        if result.get("list_mode") == "cards":  # 卡片确认：字段清单透传（重放必需）
-            step["list_mode"] = "cards"
-            step["fields"] = result.get("fields")
+        if result.get("action") == "links":  # 链接确认：§6 契约键透传
+            step["record_selector"] = result.get("record_selector")
+            step["download"] = bool(result.get("download"))
+        elif result.get("list_mode") == "list":  # 列表确认：§6 契约键透传
+            step["list_mode"] = "list"
+            step["record_selector"] = result.get("record_selector")
+            step["sub_sem"] = result.get("sub_sem")
         steps.append(step)
         on_harvest(step)
 
     try:
-        picker.run_pick(page, _on_confirm)
+        picker.run_pick(page, _on_confirm, colnames=colnames)
     except PickCancelled:
         if not _resume_browse(page):
             raise  # 页面已关闭：主循环按关窗语义收尾
@@ -347,7 +353,8 @@ def _await_landing(page, state: dict, step: dict) -> None:
         step["note"] = final_url
 
 
-def record_session(page, on_step, on_harvest) -> list[dict]:
+def record_session(page, on_step, on_harvest,
+                   colnames: dict | None = None) -> list[dict]:
     """录制会话主循环：注入 recorder_js → 收 click/框选 → 混排步骤列表。
 
     流程：add_init_script(recorder_js)——每个新文档自动布防（跨页存活），
@@ -378,7 +385,7 @@ def record_session(page, on_step, on_harvest) -> list[dict]:
                 deadline = time.monotonic() + _RECORD_IDLE_TIMEOUT_SEC
                 kind = item.get("kind")
                 if kind == "pick":
-                    _enter_pick(page, steps, on_harvest)
+                    _enter_pick(page, steps, on_harvest, colnames)
                 elif kind == "click":
                     steps = merge_click_step(steps, item, None)
                     on_step(steps[-1])

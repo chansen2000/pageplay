@@ -15,11 +15,14 @@ from pageplay.actions import (
     ZERO_ROWS_PREFIX,
     check_page_risk,
     download_element,
-    extract_cards,
+    download_links,
+    extract_links,
+    extract_list,
     extract_table,
     file_size_str,
     save_table,
 )
+from pageplay.guard import Guard
 from pageplay.guard import RiskTriggered
 
 pytest.importorskip("playwright", reason="未安装 playwright 包")
@@ -163,38 +166,53 @@ def test_download_element_saves_file(real_page, table_site, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# extract_cards（真 chromium + card_site，v0.7-A 卡片列表）
+# extract_list / extract_links / download_links（真 chromium，v0.10）
 # ---------------------------------------------------------------------------
 
-# 与 conftest _CARDS_HTML 结构逐字对应：订单号 = 卡片第 1 个 div；
-# 价格 = 第 2 个 div 里的第 2 个 span
-_CARDS_FIELDS = [
-    {"label": "订单号", "rel": [{"tag": "div", "nth": 1}]},
-    {"label": "价格", "rel": [{"tag": "div", "nth": 2}, {"tag": "span", "nth": 2}]},
+# 与 conftest _LIST_HTML 结构对应：订单号宿主 sem 路径 shopInfo>orderId，
+# 商品标题在 itemInfo 内（itemTitle），键形 = 相对 root 的 sem 路径（§3.4）
+_LIST_COLUMNS = [
+    {"key": "shopInfo>orderId", "name": "订单号", "strip": "订单号:"},
+    {"key": "itemTitle", "name": "商品", "strip": None},
 ]
+_LIST_SELECTOR = 'div[class*="tradeContent"] > div[class*="tradeOrder"]'
 
 
-def test_extract_cards_two_fields(real_page, card_site):
-    """6 张卡片 × 勾选 2 字段：6 行 dict，rel 相对链逐条解析命中。"""
-    real_page.goto(f"{card_site}/cards")
-    rows = extract_cards(real_page, "div.list", _CARDS_FIELDS)
-    assert len(rows) == 6
-    assert rows[0] == {"订单号": "TB9001", "价格": "99.0"}
-    assert rows[5] == {"订单号": "TB9006", "价格": "499.0"}
+def test_extract_list_two_columns(real_page, list_site):
+    """6 单 10 件 → 10 行；记录级字段逐行重复，键按 sem 路径解析命中。"""
+    real_page.goto(f"{list_site}/list")
+    rows = extract_list(real_page, _LIST_SELECTOR, "itemInfo", _LIST_COLUMNS)
+    assert len(rows) == 10
+    assert rows[0] == {"订单号": "8801", "商品": "LSSPD-1.2 光电探测器"}
+    assert rows[1]["订单号"] == "8802"  # 记录级字段逐行重复
+    assert rows[9]["订单号"] == "8806"
 
 
-def test_extract_cards_empty_fields_raises(real_page, card_site):
-    """fields 为空 → ValueError（至少勾选一个字段）。"""
-    real_page.goto(f"{card_site}/cards")
-    with pytest.raises(ValueError, match="fields"):
-        extract_cards(real_page, "div.list", [])
+def test_extract_list_empty_columns_raises(real_page, list_site):
+    """columns 为空 → ValueError（至少勾选一列）。"""
+    real_page.goto(f"{list_site}/list")
+    with pytest.raises(ValueError, match="列"):
+        extract_list(real_page, _LIST_SELECTOR, "itemInfo", [])
 
 
-def test_extract_cards_no_card_group_raises(real_page, card_site):
-    """容器内无同签名记录组（h1 无子元素）→ ValueError 人话带重新框选指引。"""
+def test_extract_list_all_empty_rows_raises(real_page, card_site):
+    """选择器锁到无文本元素（全空行）→ ValueError 人话带重新框选指引。"""
     real_page.goto(f"{card_site}/cards")
     with pytest.raises(ValueError, match="重新框选"):
-        extract_cards(real_page, "h1", _CARDS_FIELDS)
+        extract_list(real_page, "script", None,
+                     [{"key": "x", "name": "列"}])
+
+
+def test_extract_links_and_download(real_page, file_site, tmp_path,
+                                    monkeypatch):
+    """抓链接去重 4 行；只下 3 个像文件的；文件名走 Content-Disposition。"""
+    monkeypatch.setattr(Guard, "wait", lambda self: None)  # 测试不限速
+    real_page.goto(f"{file_site}/links")
+    rows = extract_links(real_page, "#box")
+    assert len(rows) == 4
+    saved = download_links(real_page, rows, tmp_path)
+    assert sorted(p.name for p in saved) == ["b.xlsx", "c.bin", "report-a.pdf"]
+    assert not (tmp_path / "home").exists()  # 不像文件的只进 CSV
 
 
 # ---------------------------------------------------------------------------

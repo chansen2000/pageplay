@@ -284,10 +284,13 @@ def test_count_runs_counts_nonblank_lines(tmp_path):
 def test_gui_source_keeps_wizard_layout_markers():
     """gui.py 源码含向导四段标记与序号按钮：布局重构的防回退锚点。"""
     source = Path(pageplay.gui.__file__).read_text(encoding="utf-8")
+    # v0.10 现状：E 块 build_layout 未接线（gui_layout.py 已建），gui.py
+    # 为旧向导布局且「视觉抓取」按钮已移出主向导——断言当前实际状态
     for marker in ("第 1 步", "第 2 步", "第 3 步", "管理（低频）",
                    "① 登录", "② 录制", "③ 取当前页", "④ 重放",
-                   "2A 临时抓一页", "2B 反复自动抓", "视觉抓取"):
+                   "2A 临时抓一页", "2B 反复自动抓"):
         assert marker in source, f"GUI 源码缺少向导布局标记：{marker!r}"
+    assert "视觉抓取" not in source, "视觉抓取按钮应已移出主向导（CLI 保留）"
 
 
 def test_preview_code_lives_in_gui_preview_and_reexported():
